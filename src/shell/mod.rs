@@ -1,0 +1,34 @@
+//! Shell UI (Win32/D2D). Pembagian: docs/port/shell-split.md; rencana sisa dan pemilik file: docs/port/rencana-sisa.md.
+//! `prelude` me-re-ekspor semua modul di bawah (meniru satu unit kompilasi C++).
+pub mod state;
+pub mod prelude;
+pub mod core_c1;
+pub mod core_c2;
+pub mod core_c3;
+pub mod core_c3b;
+pub mod core_c4;
+pub mod core_c4b;
+pub mod desk_icons;
+pub mod notch;
+pub mod start;
+pub mod start_draw;
+pub mod flyout;
+pub mod qs;
+pub mod hotkeys;
+pub mod shot_area;
+pub mod cliphist;
+pub mod cliphist_ui;
+pub mod emoji_ui;
+pub mod snap;
+pub mod winx;
+pub mod overlay;
+pub mod tasks_ui;
+pub mod panel;
+pub mod widgets;
+pub mod calendar;
+pub mod gesture_ui;
+pub mod filesearch;
+pub mod usb;
+pub mod nl_ui;
+pub mod diag_ui;
+pub mod stophosts_ui;

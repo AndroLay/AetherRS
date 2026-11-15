@@ -1,0 +1,22 @@
+﻿Label=cpp  waktu=2026-11-14T12:12:43  sampel=30s  cores=16
+RAM total 14,075 MB, tersedia 5,779 MB
+--- Proses Win12 ---
+
+
+Nama       : win12shell
+PID        : 13308
+WS_MB      : 101.3
+Priv_MB    : 43.4
+Handles    : 880
+Threads    : 31
+CPU_persen : 0.34
+Path       : C:\Users\andro\Pictures\win12-shell\win12shell.exe
+Args       : "C:\Users\andro\Pictures\win12-shell\win12shell.exe"
+--- Berkas exe ---
+C:\Users\andro\Pictures\win12-shell\win12shell.exe  704512 B  2026-11-13 12:36  SHA256=0D718F97C5BF5F0FCB7E81D5A5EBE2200B7782BE1221958D70C7942440C73CC0
+C:\Users\andro\Pictures\win12-shell-rust\install\win12shell.exe  (tidak ada)
+--- Autostart ---
+Run Win12Shell   : (tidak ada)
+Winlogon Shell   : (tidak ada)
+Pintasan Startup : Win12 Shell.lnk
+Tugas terjadwal  : (tidak ada)
