@@ -3,7 +3,7 @@ name = "w12"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "AetherRS: desktop shell kustom untuk Windows berbasis Rust (Direct2D/Mica, Notch, File Manager + ConPTY)"
+description = "AetherRS: lightweight custom Windows desktop shell written in Rust (Direct2D/Mica, Notch, File Manager + ConPTY)"
 
 [dependencies]
 windows = { version = "0.61", features = [
@@ -88,7 +88,7 @@ windows-core = "0.61"
 windows-numerics = "0.2"
 
 [profile.release]
-# Optimasi ukuran binary release tanpa mematikan unwind.
+# Optimize release binary size while keeping unwind support.
 opt-level = "s"
 lto = "thin"
 codegen-units = 1

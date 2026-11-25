@@ -1,11 +1,11 @@
-# Output build Cargo & paket rilis
+# Cargo build output & packaged releases
 /target/
 /dist/
 
-# Folder pemasangan lokal (deploy-win12-rust.ps1)
+# Local install directory (deploy-win12-rust.ps1)
 /install/
 
-# Artefak biner & objek hasil kompilasi
+# Compiled binaries & object files
 *.exe
 *.dll
 *.pdb
@@ -15,7 +15,7 @@
 *.res
 *.zip
 
-# Log, cadangan, registri lokal, dan data runtime
+# Logs, backups, local registry dumps, and runtime data
 *.log
 *.tmp
 *.bak
@@ -28,7 +28,7 @@
 settings.ini
 widgets.ini
 
-# Berkas sistem & editor
+# OS & editor files
 Thumbs.db
 desktop.ini
 .DS_Store

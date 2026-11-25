@@ -1,8 +1,11 @@
 Copyright (c) 2026 AndroLay. All rights reserved.
 
-Kode sumber dan aset di dalam repositori AetherRS ini adalah hak milik AndroLay.
-Dilarang menyalin, memodifikasi, mendistribusikan ulang, atau memublikasikan
-kode sumber ini tanpa izin tertulis dari pemilik.
+The source code, design, and assets in this AetherRS repository are the
+exclusive property of AndroLay.
 
-Rilis biner resmi (.exe / .zip) hanya untuk penggunaan pribadi pengguna akhir
-dan tidak memberikan lisensi atas kode sumbernya.
+Copying, modifying, redistributing, publishing, reverse engineering, or using
+any part of this source code without prior written permission from the
+copyright holder is strictly prohibited.
+
+Official binary releases (.exe / .zip) are licensed for personal end-user use
+only and do not grant any rights to the underlying source code.

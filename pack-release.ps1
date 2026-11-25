@@ -1,7 +1,7 @@
-# pack-release.ps1 - kemas rilis biner AetherRS ke folder dist\ (hanya .exe, skrip, LICENSE, SHA256).
-# Kode sumber (.rs) dan docs/port/ tidak disertakan.
+# pack-release.ps1 - package AetherRS binary-only release into dist\ (.exe, scripts, LICENSE, SHA256).
+# Source files (.rs) and internal docs (docs/port/) are never included.
 #
-# Contoh:
+# Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\pack-release.ps1" -Version 0.1.0
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\pack-release.ps1" -Version 0.1.0 -Build
 param(
@@ -23,7 +23,7 @@ if ($Build) {
     Push-Location $proj
     try {
         cmd /c 'cargo build --release --bins -j 2'
-        if ($LASTEXITCODE -ne 0) { throw 'cargo build --release gagal.' }
+        if ($LASTEXITCODE -ne 0) { throw 'cargo build --release failed.' }
     } finally {
         Pop-Location
     }
@@ -34,7 +34,7 @@ $relDir = Join-Path $proj 'target\release'
 foreach ($b in $bins) {
     $p = Join-Path $relDir $b
     if (-not (Test-Path -LiteralPath $p)) {
-        throw "Binary tidak ditemukan: $p. Jalankan cargo build --release --bins -j 2 atau tambahkan -Build."
+        throw "Binary not found: $p. Run 'cargo build --release --bins -j 2' or pass -Build."
     }
 }
 
@@ -42,7 +42,7 @@ if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recu
 if (Test-Path -LiteralPath $zipPath)  { Remove-Item -LiteralPath $zipPath -Force }
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 
-# Salin hanya artefak biner & skrip pengguna (tanpa kode sumber).
+# Copy only release binaries and user scripts (no source code).
 foreach ($b in $bins) {
     Copy-Item -LiteralPath (Join-Path $relDir $b) -Destination (Join-Path $stageDir $b) -Force
 }
@@ -55,7 +55,7 @@ foreach ($f in @('LICENSE', 'CHANGELOG.md', 'win12-files-assoc.ps1', 'uninstall-
 
 Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -CompressionLevel Optimal -Force
 
-# Buat berkas checksum SHA256 untuk verifikasi pengguna.
+# Generate SHA256 checksums for user verification.
 $lines = New-Object System.Collections.Generic.List[string]
 $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $lines.Add("$zipHash  $(Split-Path $zipPath -Leaf)")
@@ -65,9 +65,9 @@ foreach ($b in $bins) {
 }
 $lines | Set-Content -LiteralPath $sumPath -Encoding ASCII
 
-# Hapus folder staging agar dist\ hanya berisi arsip rilis & checksum.
+# Clean up staging folder so dist\ only contains the archive and checksums.
 Remove-Item -LiteralPath $stageDir -Recurse -Force
 
-Write-Output "Paket rilis siap:"
-Write-Output "  Arsip    : $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1KB, 1)) KB)"
-Write-Output "  Checksum : $sumPath"
+Write-Output 'Release package ready:'
+Write-Output "  Archive  : $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1KB, 1)) KB)"
+Write-Output "  Checksums: $sumPath"
