@@ -124,6 +124,6 @@ Perbarui `C:\Users\andro\.claude\projects\C--Windows-System32\memory\win12-rust-
 - [x] T10 hotkeys/winx/snap  - [x] T11 overlay  - [x] T12 tasks_ui/stophosts/calendar
 - [x] T13 filesearch  - [x] T14 gesture/usb/nl/diag  - [x] T15 core_c4  - [x] T16 core_c4b
 - [x] Integrasi 1–5 (lib 0 error)  - [x] bin + build.rs  - [x] build release (2026-11-14, rc=0, 0 error, 0 warning)  - [x] pasang (pengguna; deploy cadangan 23:38:53, shell PID 20196 mulai 23:39:18; pengguna melapor "sudah berhasil")
-- [x] B1 deploy: parameter `-Shell` (parse OK)  - [x] B2 Del hapus item riwayat clipboard; emoji 8×8 (cargo check 0/0; build release 0 warning)  - [ ] pasang build B1/B2 + mode shell: butuh PowerShell admin pengguna (sesi asisten tidak elevated; UAC dibatalkan 2026-11-15)  - [ ] Phone Link admin (PhoneSvc Disabled, 2 paket provisioned)  - [ ] uji runtime B2 dan mode shell setelah pasang
+- [x] B1 deploy: parameter `-Shell` (parse OK)  - [x] B2 Del hapus item riwayat clipboard; emoji 8×8 (cargo check 0/0; build release 0 warning)  - [x] pasang build B1/B2 + `-Shell` (pengguna, PowerShell admin, 2026-11-15 08:14:40, DEPLOY_RC=0, shell pid 20596)  - [x] Phone Link admin (PhoneSvc Disabled; 2 paket provisioned dihapus, cek ulang kosong)  - [ ] uji runtime B2 dan mode shell setelah pasang  - [x] A2 HKLM Winlogon\Shell = win12boot.exe (2026-11-15 08:25:42; belum diuji sign-in)  - [x] A7 commit lokal `3d4feb0` (tanpa remote, belum di-push)
 
 Catatan error tersisa per tugas:

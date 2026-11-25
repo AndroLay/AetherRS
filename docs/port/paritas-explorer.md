@@ -85,3 +85,19 @@ Catat hasil tiap langkah: lulus, gagal (dengan pesan), atau tidak bisa diuji.
 - Winlogon tidak ditulis. `WINLOGON_WRITE_ENABLED = false` (`src/bin/win12boot.rs:50`). Komentar `// PORT: menulis Winlogon\Shell, JANGAN dijalankan` ada di `win12boot.rs:456`, `489`, `637`. Aturan "tidak boleh dipanggil dari tes" ada di komentar `win12boot.rs:3`; belum dicek dengan pencarian pemanggil.
 - Tidak ada commit, push, atau PR dari pekerjaan ini.
 - Line ending dibiarkan apa adanya (CRLF di `overlay.rs`, LF di sebagian file lain). `CONVENTIONS.md` tidak mengatur ini, dan rustc menerima keduanya. Menormalisasi berarti menulis ulang file besar tanpa dampak fungsional.
+
+## Desktop setara Explorer (2026-11-23, build release rc=0, 0 warning; BELUM dideploy, BELUM diuji runtime)
+
+`src/shell/desk_icons.rs` ditulis ulang (versi lama: `%TEMP%\desk_icons-before-20261123.rs`). `desk_proc` (`core_c3b.rs`) meneruskan semua pesan lewat `desk_icons_on_message`; `desk_menu` mendelegasikan ke `desk_background_menu`.
+
+- Isi: namespace Desktop asli (`IShellFolder::EnumObjects`), termasuk Desktop publik dan ikon sistem sesuai `HideDesktopIcons\NewStartPanel`; urutan alami (`StrCmpLogicalW`); ikon `IShellItemImageFactory` + panah pintasan; ukuran 32/48/96 mengikuti DPI dan font judul ikon.
+- Pilihan: klik, Ctrl/Shift+klik, kotak seleksi (marquee), hover, panah, Ctrl+A.
+- Menu item: menu konteks shell asli (`IContextMenu3`, submenu "Kirim ke", "Buka dengan", ekstensi pihak ketiga); Shift+klik kanan = verb diperluas. Folder dibuka di win12files.
+- Menu latar: Tampilan (ukuran, tampilkan ikon), Segarkan, Tempel/Tempel pintasan, Baru (`CLSID_NewMenu`, item baru langsung masuk mode ganti nama), wallpaper, Kosongkan Tempat Sampah, Personalisasi, Pengaturan layar.
+- Keyboard: Enter, Delete, F2, F5, Ctrl+C/X/V, Alt+Enter (Properti), tombol menu / Shift+F10.
+- Ganti nama di tempat (EDIT + `SetNameOf`), nama tanpa ekstensi terpilih.
+- Pembaruan otomatis: `SHChangeNotifyRegister` (Desktop pengguna, publik, Tempat Sampah).
+- Seret-lepas: seret keluar (`SHDoDragDrop`), jatuhkan ke latar / folder / Tempat Sampah / aplikasi (`IDropTarget` + `IDropTargetHelper`).
+- Belum: posisi ikon bebas (pengaturan otomatis seperti "Atur otomatis"), urutkan berdasarkan, thumbnail gambar.
+
+Uji yang disarankan setelah deploy: klik kanan file (Kirim ke, Buka dengan), Baru > Folder lalu ketik nama, seret file dari win12files ke desktop, seret ikon ke Tempat Sampah, F2, Delete, Ctrl+C lalu Ctrl+V, ukuran ikon.

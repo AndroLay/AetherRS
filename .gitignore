@@ -1,8 +1,14 @@
 # Output build Cargo (berukuran besar, bisa dibuat ulang)
 /target/
 
+# Paket rilis biner (dibuat oleh pack-release.ps1)
+/dist/
+
 # Hasil deploy (exe terpasang); dibuat ulang oleh deploy-win12-rust.ps1
 /install/
+
+# Cadangan registri mesin lokal
+docs/port/backup-*.reg
 
 # Log dan berkas sementara
 *.log
