@@ -7,7 +7,11 @@ description = "Port Rust dari Win12 Shell (sumber C++/C di ..\\win12-shell)"
 
 [dependencies]
 windows = { version = "0.61", features = [
+    "ApplicationModel",
     "Devices_Radios",
+    "UI",
+    "UI_Notifications",
+    "UI_Notifications_Management",
     "Foundation",
     "Foundation_Collections",
     "Foundation_Numerics",
@@ -21,6 +25,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Networking_NetworkListManager",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
@@ -60,6 +65,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Pipes",
     "Win32_System_Ole",
     "Win32_System_Performance",
     "Win32_System_Power",
@@ -82,4 +88,8 @@ windows-core = "0.61"
 windows-numerics = "0.2"
 
 [profile.release]
-opt-level = 2
+# Profil ramping (terinspirasi WinRust): pangkas simbol & kode mati lintas-binary tanpa mematikan unwind.
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true

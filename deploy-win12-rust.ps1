@@ -19,7 +19,9 @@
 param(
     [switch]$SkipBuild,
     [switch]$Shell,
-    [string]$InstallDir = 'C:\Users\andro\Pictures\win12-shell-rust\install'
+    [string]$InstallDir = 'C:\Users\andro\Pictures\win12-shell-rust\install',
+    [int]$KeepBackups = 5,
+    [switch]$RestorePoint
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +41,18 @@ $stage     = 'awal'
 $pasangPrefix = [System.IO.Path]::GetFullPath($dir).TrimEnd('\') + '\'
 $shellMode = @(Get-CimInstance Win32_Process -Filter "Name='win12boot.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($pasangPrefix, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
 
-function Clear-Updating { Remove-ItemProperty -LiteralPath $ourKey -Name Updating -ErrorAction SilentlyContinue }
+# Penanda deploy: registri + berkas install\updating.flag (win12boot membaca keduanya; nilai registri dari sesi
+# agen tidak selalu terlihat oleh win12boot, 2026-11-19).
+$updFlag = Join-Path $dir 'updating.flag'
+function Set-Updating {
+    if (-not (Test-Path $ourKey)) { New-Item -Path $ourKey -Force | Out-Null }
+    Set-ItemProperty -LiteralPath $ourKey -Name Updating -Value 1 -Type DWord
+    Set-Content -LiteralPath $updFlag -Value (Get-Date -Format o) -Encoding ascii
+}
+function Clear-Updating {
+    Remove-ItemProperty -LiteralPath $ourKey -Name Updating -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $updFlag -Force -ErrorAction SilentlyContinue
+}
 
 Add-Type -Name Native -Namespace W12 -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);'
 
@@ -82,22 +95,35 @@ try {
         $warn = @(Select-String -Path $cargoLog -Pattern '^warning' -ErrorAction SilentlyContinue).Count
         "Build OK (peringatan kompiler: $warn). Log: $cargoLog"
     }
+    # Sumber kebenaran adalah target\release. Salinan TEMP selalu diambil ulang dari sana, agar build lama
+    # di TEMP tidak pernah ikut terpasang (sebelumnya -SkipBuild memakai TEMP apa adanya).
+    foreach ($n in @('win12shell.exe', 'win12boot.exe', 'win12files.exe')) {
+        $fromTarget = Join-Path $proj "target\release\$n"
+        if (Test-Path $fromTarget) { Copy-Item $fromTarget (Join-Path $src $n) -Force }
+    }
 
     # 2. Periksa build di TEMP ada dan tidak lebih lama daripada kode sumber.
     $stage = 'cek build'
     foreach ($p in @($newShell, $newBoot, $newFiles)) {
         if (-not (Test-Path $p)) { throw "Build tidak ditemukan: $p. Jalankan tanpa -SkipBuild." }
     }
-    $tShell = (Get-Item $newShell).LastWriteTime
-    $srcList = @(Get-ChildItem -Path (Join-Path $proj 'src') -Recurse -Filter '*.rs' | ForEach-Object { $_.FullName })
+    # Semua bin harus tidak lebih lama daripada sumber terbaru (src termasuk aset, Cargo.toml, Cargo.lock, resource).
+    $srcList = @(Get-ChildItem -Path (Join-Path $proj 'src') -Recurse -File | ForEach-Object { $_.FullName })
     $srcList += @(
         (Join-Path $proj 'build.rs'),
         (Join-Path $proj 'Cargo.toml'),
+        (Join-Path $proj 'Cargo.lock'),
         (Join-Path $proj 'win12shell.rc'),
         (Join-Path $proj 'win12shell.manifest')
     )
-    foreach ($f in $srcList) {
-        if ((Get-Item $f).LastWriteTime -gt $tShell) { throw "$(Split-Path $f -Leaf) lebih baru daripada build. Jalankan tanpa -SkipBuild." }
+    $srcList = @($srcList | Where-Object { Test-Path $_ })
+    $tSrc = @($srcList | ForEach-Object { (Get-Item $_).LastWriteTime } | Sort-Object | Select-Object -Last 1)[0]
+    # Hanya untuk -SkipBuild: setelah cargo build, bin yang tidak di-link ulang (sumbernya tidak berubah) memang
+    # lebih lama daripada sumber terbaru, tetapi tetap mutakhir menurut cargo (2026-11-19: salah tolak).
+    if ($SkipBuild) {
+        foreach ($p in @($newShell, $newBoot, $newFiles)) {
+            if ((Get-Item $p).LastWriteTime -lt $tSrc) { throw "$(Split-Path $p -Leaf) di TEMP lebih lama daripada sumber. Jalankan tanpa -SkipBuild." }
+        }
     }
     $hashShell = (Get-FileHash $newShell -Algorithm SHA256).Hash
     $hashBoot  = (Get-FileHash $newBoot -Algorithm SHA256).Hash
@@ -118,19 +144,42 @@ try {
         throw 'mode shell diminta, tetapi Progman (desktop Explorer) masih ada; --shell akan diabaikan. Shell lama tidak disentuh.'
     }
 
+    # 2d. Opsional: buat System Restore Point sebelum menyentuh instalasi (butuh Administrator).
+    if ($RestorePoint) {
+        $stage = 'restore point'
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($isAdmin) {
+            try {
+                Checkpoint-Computer -Description "Win12 Shell Rust deploy $ts" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+                'System Restore Point berhasil dibuat.'
+            } catch {
+                "Peringatan: gagal membuat Restore Point ($($_.Exception.Message)); lanjutkan deploy."
+            }
+        } else {
+            'Peringatan: -RestorePoint dilewati (butuh PowerShell Administrator).'
+        }
+    }
+
     # 3. Hentikan shell lama lewat --exit (tanpa paksa).
     $stage = 'hentikan shell lama'
     if ($shellMode) {
         'Mode shell penuh aktif: win12boot menunggu sampai file baru terpasang.'
-        if (-not (Test-Path $ourKey)) { New-Item -Path $ourKey -Force | Out-Null }
-        Set-ItemProperty -LiteralPath $ourKey -Name Updating -Value 1 -Type DWord
+        $deployStart = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Set-Updating
     }
     $old = Get-Win12 | Where-Object { $_.Name -eq 'win12shell.exe' } | Select-Object -First 1
     if ($old) {
         $oldExe = if ($old.ExecutablePath) { $old.ExecutablePath } else { $shellPath }
         "Menghentikan shell lama (pid $($old.ProcessId)) lewat --exit ..."
+        # Pegang handle proses lama SEBELUM --exit: proses bisa tetap ada (sedang ditutup) setelah path exe-nya
+        # tidak terbaca lagi oleh CIM. 2026-11-19: win12boot baru melihat shell keluar ~60 dtk kemudian, saat
+        # Updating sudah dihapus, lalu menjalankan Explorer cadangan. Kini ditunggu sampai proses benar-benar hilang.
+        $oldProc = Get-Process -Id $old.ProcessId -ErrorAction SilentlyContinue
+        $swExit = [System.Diagnostics.Stopwatch]::StartNew()
         $p = Start-Process -FilePath $oldExe -ArgumentList '--exit' -PassThru
         if (-not $p.WaitForExit(15000)) { throw '--exit belum selesai dalam 15 detik.' }
+        if ($oldProc -and -not $oldProc.WaitForExit(120000)) { throw "shell lama (pid $($old.ProcessId)) belum keluar dalam 120 detik (skrip ini tidak memaksa)." }
+        "Shell lama keluar setelah $([math]::Round($swExit.Elapsed.TotalSeconds,1)) dtk."
     }
     if (-not (Wait-Until { (Get-Win12).Count -eq 0 } 5000)) {
         Get-Win12 | ForEach-Object { "  masih jalan: $($_.Name) pid=$($_.ProcessId)" }
@@ -168,9 +217,24 @@ try {
         if ($shellMode) { 'win12boot.exe baru terpasang; berlaku mulai login berikutnya.' } else { 'win12boot.exe terpasang.' }
     }
 
+    # 5b. Rotasi cadangan lama (simpan $KeepBackups terbaru per binary; file yang masih dipakai proses dilewati).
+    if ($KeepBackups -gt 0) {
+        foreach ($pfx in @('win12shell-before-deploy-rust-*.exe', 'win12files-before-deploy-rust-*.exe', 'win12boot-before-deploy-rust-*.exe')) {
+            Get-ChildItem -LiteralPath $dir -Filter $pfx -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -Skip $KeepBackups |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
     # 6. Jalankan shell baru. Mode shell penuh: win12boot yang menjalankannya dengan --shell.
     $stage = 'jalankan'
     if ($shellMode) {
+        # Hapus penanda hanya setelah win12boot mencatat "deploy: menunggu shell baru" (maks 5 dtk), agar
+        # pemasangan yang cepat tidak mendahului pemeriksaan win12boot (2026-11-19).
+        $bootLog = Join-Path $dir 'boot.log'
+        $seen = Wait-Until { @(Get-Content -LiteralPath $bootLog -Tail 8 -ErrorAction SilentlyContinue | Where-Object { $_ -like '*deploy: menunggu shell baru*' -and $_ -ge $deployStart }).Count -gt 0 } 5000
+        if (-not $seen) { 'Catatan: win12boot belum mencatat jeda deploy dalam 5 dtk.' }
         Clear-Updating
     }
     else {
@@ -180,13 +244,20 @@ try {
             if ($Shell) { Start-Process -FilePath $shellPath -ArgumentList '--shell' } else { Start-Process -FilePath $shellPath }
         }
     }
-    if (-not (Wait-Until { @(Get-Win12 | Where-Object { $_.Name -eq 'win12shell.exe' }).Count -gt 0 } 8000)) { throw 'shell baru tidak berjalan dalam 8 detik.' }
+    # 30 dtk: bila Explorer sempat mengambil alih desktop, win12boot menutupnya dulu (terukur 16 dtk, 2026-11-24).
+    if (-not (Wait-Until { @(Get-Win12 | Where-Object { $_.Name -eq 'win12shell.exe' }).Count -gt 0 } 30000)) { throw 'shell baru tidak berjalan dalam 30 detik.' }
     $pillUp = Wait-Until { [W12.Native]::FindWindow('Win12ShellPill', $null).ToInt64() -ne 0 } 8000
 
     # 7. Ringkasan.
     $stage = 'ringkasan'
     $sp = Get-Win12 | Where-Object { $_.Name -eq 'win12shell.exe' } | Select-Object -First 1
     "Shell berjalan: pid $($sp.ProcessId) dari $($sp.ExecutablePath)"
+    # Pastikan proses yang berjalan memang build yang baru dipasang (bukan sisa proses lama).
+    if ($sp -and $sp.ExecutablePath -and (Get-FileHash $sp.ExecutablePath -Algorithm SHA256).Hash -eq $hashShell) {
+        'Proses yang berjalan cocok dengan build (SHA256 OK).'
+    } else {
+        'PERINGATAN: proses yang berjalan BUKAN build yang baru dipasang. Cek manual.'
+    }
     if ($pillUp) { 'Pil dok terdeteksi (UI aktif).' } else { 'PERINGATAN: pil dok belum terdeteksi. Cek layar.' }
     $startup = Join-Path $dir 'win12-startup.ps1'
     if (Test-Path $startup) {
