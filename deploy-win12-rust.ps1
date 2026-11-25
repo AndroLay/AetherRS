@@ -1,12 +1,10 @@
-# deploy-win12-rust.ps1 - membangun bin Rust Win12 Shell (cargo build --release) ke folder TEMP,
-# menghentikan shell lama lewat --exit (tanpa paksa), memasang salinan ke folder pasang,
-# lalu menjalankan shell baru dan memeriksa pil dok.
+# deploy-win12-rust.ps1 - build release AetherRS ke folder TEMP, hentikan shell lama
+# lewat --exit (tanpa paksa), salin ke folder pasang, lalu jalankan shell baru.
 #
-# PORT: skrip ini DIBUAT tetapi TIDAK DIJALANKAN oleh sesi port. Pemasangan dilakukan pengguna sendiri.
-# Meniru deploy-win12.ps1 (C++) dengan perbedaan:
-#  - build lewat cargo (bukan g++/gcc); keluaran ke folder TEMP terpisah (win12build-rust);
-#  - tidak ada fallback Stop-Process (header skrip C++ menyatakan "tanpa Stop-Process");
-#  - win12guard.exe tidak dipasang; hanya proses guard lama yang ditunggu berhenti.
+# Perbedaan dari versi C++:
+#  - build lewat cargo (keluaran ke TEMP\win12build-rust);
+#  - tanpa Stop-Process;
+#  - win12guard.exe tidak dipasang, hanya proses guard lama yang ditunggu berhenti.
 #
 # Cara pakai:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\andro\Pictures\win12-shell-rust\deploy-win12-rust.ps1"
@@ -41,8 +39,7 @@ $stage     = 'awal'
 $pasangPrefix = [System.IO.Path]::GetFullPath($dir).TrimEnd('\') + '\'
 $shellMode = @(Get-CimInstance Win32_Process -Filter "Name='win12boot.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($pasangPrefix, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
 
-# Penanda deploy: registri + berkas install\updating.flag (win12boot membaca keduanya; nilai registri dari sesi
-# agen tidak selalu terlihat oleh win12boot, 2026-11-19).
+# Penanda deploy: registri + berkas install\updating.flag (win12boot membaca keduanya sebagai cadangan).
 $updFlag = Join-Path $dir 'updating.flag'
 function Set-Updating {
     if (-not (Test-Path $ourKey)) { New-Item -Path $ourKey -Force | Out-Null }

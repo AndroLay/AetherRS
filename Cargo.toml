@@ -88,7 +88,7 @@ windows-core = "0.61"
 windows-numerics = "0.2"
 
 [profile.release]
-# Profil ramping (terinspirasi WinRust): pangkas simbol & kode mati lintas-binary tanpa mematikan unwind.
+# Optimasi ukuran binary release tanpa mematikan unwind.
 opt-level = "s"
 lto = "thin"
 codegen-units = 1

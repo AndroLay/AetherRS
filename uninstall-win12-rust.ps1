@@ -1,8 +1,7 @@
-# uninstall-win12-rust.ps1 - pemulihan & pencabutan Win12 Shell (Rust) secara deterministik dan dapat dibalik.
-# Terinspirasi pola uninstall satu-klik WinRust: mengembalikan asosiasi folder, autostart, Winlogon\Shell
-# (bila mengarah ke Win12), dan taskbar/Explorer bawaan. Pengaturan pengguna di install\ dipertahankan.
+# uninstall-win12-rust.ps1 - matikan AetherRS dan pulihkan asosiasi folder, autostart,
+# Winlogon\Shell (bila menunjuk Win12), serta taskbar/Explorer bawaan.
 #
-# Pemakaian (dijalankan sendiri oleh pengguna):
+# Contoh:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\uninstall-win12-rust.ps1" -DryRun
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\uninstall-win12-rust.ps1"
 param(

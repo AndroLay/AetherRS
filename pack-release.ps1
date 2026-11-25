@@ -1,8 +1,7 @@
-# pack-release.ps1 - mengemas rilis biner publik Win12 Shell (Rust) ke folder dist\.
-# Hanya menyertakan binary .exe hasil build release, skrip pengguna, README, dan LICENSE.
-# Kode sumber (.rs) dan dokumen internal (docs/port/) TIDAK pernah dimasukkan ke paket rilis.
+# pack-release.ps1 - kemas rilis biner AetherRS ke folder dist\ (hanya .exe, skrip, LICENSE, SHA256).
+# Kode sumber (.rs) dan docs/port/ tidak disertakan.
 #
-# Pemakaian:
+# Contoh:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\pack-release.ps1" -Version 0.1.0
 #   powershell -NoProfile -ExecutionPolicy Bypass -File ".\pack-release.ps1" -Version 0.1.0 -Build
 param(
@@ -15,7 +14,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $proj = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $proj 'dist'
-$stageDir = Join-Path $dist "win12-shell-v$Version-win64"
+$stageDir = Join-Path $dist "AetherRS-v$Version-win64"
 $zipPath = "$stageDir.zip"
 $sumPath = Join-Path $dist "SHA256SUMS-v$Version.txt"
 
