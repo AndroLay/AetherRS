@@ -462,6 +462,98 @@ pub fn pills_hide_for() {
     quiet_start(2500);
 }
 
+static LAST_CENTERED_DLG: SyncCell<Cell<HWND>> = SyncCell::new(Cell::new(HWND(std::ptr::null_mut())));
+
+/// Read lowercase executable basename for a top-level window (resolving UWP CoreWindow child if hosted).
+unsafe fn window_exe_basename(h: HWND) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let mut pid: u32 = 0;
+    let cls = class_of(h);
+    if cls == "ApplicationFrameWindow" {
+        let core = to_wide_z("Windows.UI.Core.CoreWindow");
+        if let Ok(c) = FindWindowExW(Some(h), None, pcw(&core), PCWSTR::null()) {
+            if !c.0.is_null() {
+                GetWindowThreadProcessId(c, Some(&mut pid as *mut u32));
+            }
+        }
+    }
+    if pid == 0 {
+        GetWindowThreadProcessId(h, Some(&mut pid as *mut u32));
+    }
+    if pid == 0 {
+        return None;
+    }
+    let hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+    let mut buf = [0u16; MAX_PATH as usize];
+    let mut n = MAX_PATH;
+    let ok = QueryFullProcessImageNameW(hp, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+    let _ = CloseHandle(hp);
+    if !ok || n == 0 {
+        return None;
+    }
+    let full = from_wide(&buf[..n as usize]);
+    let base = full.rsplit(['\\', '/']).next().unwrap_or(&full);
+    Some(base.to_ascii_lowercase())
+}
+
+/// Center Windows system picker dialogs (e.g. OpenWith "Just once / Always / Set default")
+/// that fall back to the top-left corner (0, 0) when Explorer's taskbar is hidden or absent.
+unsafe fn center_stuck_system_dialog(h: HWND) {
+    if h.0.is_null() || h == LAST_CENTERED_DLG.get() || is_our_window(h) {
+        return;
+    }
+    if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() || IsZoomed(h).as_bool() {
+        return;
+    }
+    let mut rc = RECT::default();
+    if GetWindowRect(h, &mut rc).is_err() {
+        return;
+    }
+    let w = rc.right - rc.left;
+    let ht = rc.bottom - rc.top;
+    if w < 200 || ht < 150 {
+        return;
+    }
+    let mon = MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+        return;
+    }
+    let work = mi.rcWork;
+    let ww = work.right - work.left;
+    let wh = work.bottom - work.top;
+    // Skip fullscreen/near-maximized windows and windows not stuck near the top-left corner.
+    if w >= ww - 40 || ht >= wh - 40 {
+        return;
+    }
+    if rc.left < work.left - 16 || rc.left > work.left + 24 || rc.top < work.top - 16 || rc.top > work.top + 24 {
+        return;
+    }
+    let Some(exe) = window_exe_basename(h) else {
+        return;
+    };
+    if !matches!(exe.as_str(), "openwith.exe" | "pickerhost.exe" | "credentialuibroker.exe") {
+        return;
+    }
+    let nx = work.left + (ww - w) / 2;
+    let ny = work.top + (wh - ht) / 2;
+    let _ = SetWindowPos(
+        h,
+        None,
+        nx,
+        ny,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+    );
+    LAST_CENTERED_DLG.set(h);
+}
+
 /// `WinEventProc` (C++ 4200): hook WinEvent untuk jendela app, taskbar bawaan, dan foreground.
 pub unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
@@ -495,12 +587,18 @@ pub unsafe extern "system" fn win_event_proc(
                 return;
             }
         }
-        if has_h && is_win && is_self && is_new_app_window(h) {
-            pills_hide_for();
+        if has_h && is_win && is_self {
+            center_stuck_system_dialog(h);
+            if is_new_app_window(h) {
+                pills_hide_for();
+            }
         }
         return;
     }
     if ev == EVENT_OBJECT_DESTROY {
+        if has_h && is_win && h == LAST_CENTERED_DLG.get() {
+            LAST_CENTERED_DLG.set(HWND(std::ptr::null_mut()));
+        }
         // Jendela app ditutup: fokus sementara ke desktop tidak menampilkan pil atas.
         if has_h && is_win && is_self && is_known_app_window(h) {
             quiet_start(1000);
@@ -524,6 +622,9 @@ pub unsafe extern "system" fn win_event_proc(
     }
     if ev == EVENT_SYSTEM_MINIMIZEEND && is_win && has_h && is_new_app_window(h) {
         pills_hide_for(); // app dipulihkan dari dok
+    }
+    if ev == EVENT_SYSTEM_FOREGROUND && is_win && has_h {
+        center_stuck_system_dialog(h);
     }
     if ev == EVENT_SYSTEM_FOREGROUND || ev == EVENT_SYSTEM_MINIMIZESTART || ev == EVENT_SYSTEM_MINIMIZEEND {
         update_foreground(false);
