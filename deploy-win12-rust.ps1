@@ -147,7 +147,7 @@ try {
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         if ($isAdmin) {
             try {
-                Checkpoint-Computer -Description "Win12 Shell Rust deploy $ts" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+                Checkpoint-Computer -Description "AetherRS deploy $ts" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
                 'System Restore Point berhasil dibuat.'
             } catch {
                 "Peringatan: gagal membuat Restore Point ($($_.Exception.Message)); lanjutkan deploy."

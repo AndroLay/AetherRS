@@ -273,7 +273,7 @@ fn ssid_copy(s: &DOT11_SSID) -> DOT11_SSID {
 
 /// Memeriksa portal tawanan lewat WinHTTP (sumber WlCheckCaptivePortal, baris 76-111).
 fn wl_captive_portal() -> bool {
-    let agent = to_wide_z("Win12Shell/1.0");
+    let agent = to_wide_z("AetherRS/0.1");
     let host = to_wide_z("www.msftconnecttest.com");
     let verb = to_wide_z("GET");
     let path = to_wide_z("/connecttest.txt");

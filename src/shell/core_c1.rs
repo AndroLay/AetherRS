@@ -1305,7 +1305,7 @@ pub fn resolve_entry(entry: &str) -> Option<App> {
                 a.launch = copy_wide(&wf, 600);
                 a.icon_name = copy_wide(&wf, 600);
                 a.exe = copy_wide(&wf, MAX_PATH);
-                a.name = copy_wide("Win12 Explorer", 128);
+                a.name = copy_wide("AetherRS Files", 128);
             } else if a.exe.is_empty() {
                 a.exe = copy_wide(&format!("{}\\explorer.exe", windows_directory()), MAX_PATH);
             }
@@ -1345,7 +1345,7 @@ pub fn resolve_entry(entry: &str) -> Option<App> {
             a.aumid = copy_wide("Microsoft.Windows.Explorer", 256);
             a.launch = copy_wide(&wf, 600);
             a.exe = lower(&wf);
-            a.name = copy_wide("Win12 Explorer", 128);
+            a.name = copy_wide("AetherRS Files", 128);
         }
     }
     Some(a)
@@ -1355,9 +1355,9 @@ pub fn resolve_entry(entry: &str) -> Option<App> {
 
 /// Teks awal apps.txt (C++ 661–667). Semuanya ASCII, jadi bytenya sama dengan UTF-8 tanpa BOM.
 const DEFAULT_APPS: &str = concat!(
-    "# Win12 Shell - aplikasi tersemat di taskbar.\r\n",
+    "# AetherRS - aplikasi tersemat di taskbar.\r\n",
     "# Satu entri per baris: AUMID aplikasi (lihat Get-StartApps), path .exe, atau path .lnk.\r\n",
-    "# [left] = grup sebelah kiri Start, [right] = grup sebelah kanan. Simpan, lalu jalankan ulang Win12 Shell.\r\n",
+    "# [left] = grup sebelah kiri Start, [right] = grup sebelah kanan. Simpan, lalu jalankan ulang AetherRS.\r\n",
     "[left]\r\nMSEdge\r\nMicrosoft.Office.POWERPNT.EXE.15\r\nMicrosoft.Office.EXCEL.EXE.15\r\nMSTeams_8wekyb3d8bbwe!MSTeams\r\n",
     "[right]\r\nwindows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel\r\nMicrosoft.Windows.Explorer\r\n",
     "Microsoft.Windows.Photos_8wekyb3d8bbwe!App\r\nMicrosoft.WindowsCalculator_8wekyb3d8bbwe!App\r\n",
@@ -1365,7 +1365,7 @@ const DEFAULT_APPS: &str = concat!(
 
 /// Dua baris header yang ditulis SaveApps (C++ 749–750). Sama dengan dua baris pertama DEFAULT_APPS.
 const APPS_HEADER: &str = concat!(
-    "# Win12 Shell - aplikasi tersemat di taskbar.\r\n",
+    "# AetherRS - aplikasi tersemat di taskbar.\r\n",
     "# Satu entri per baris: AUMID aplikasi (lihat Get-StartApps), path .exe, atau path .lnk.\r\n",
 );
 

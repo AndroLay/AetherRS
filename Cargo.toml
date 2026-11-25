@@ -3,7 +3,7 @@ name = "w12"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Port Rust dari Win12 Shell (sumber C++/C di ..\\win12-shell)"
+description = "AetherRS: desktop shell kustom untuk Windows berbasis Rust (Direct2D/Mica, Notch, File Manager + ConPTY)"
 
 [dependencies]
 windows = { version = "0.61", features = [

@@ -294,7 +294,7 @@ pub fn main_menu(owner: HWND, pt: POINT, from_top: bool) {
         true,
     );
     let auto_text = if as_shell {
-        w!("Start with Windows (Win12 is the shell)")
+        w!("Start with Windows (AetherRS is the shell)")
     } else {
         w!("Start with Windows")
     };
@@ -306,9 +306,9 @@ pub fn main_menu(owner: HWND, pt: POINT, from_top: bool) {
     if SHELL_MODE.get() {
         let _ = unsafe { AppendMenuW(m, MF_STRING, CMD_SWITCH as usize, w!("Beralih ke Windows biasa")) };
     } else if boot_exe_path().is_some() {
-        let _ = unsafe { AppendMenuW(m, MF_STRING, CMD_SWITCH as usize, w!("Beralih ke Win12 penuh")) };
+        let _ = unsafe { AppendMenuW(m, MF_STRING, CMD_SWITCH as usize, w!("Beralih ke AetherRS penuh")) };
     }
-    let _ = unsafe { AppendMenuW(m, MF_STRING, CMD_EXIT as usize, w!("Exit Win12 Shell")) };
+    let _ = unsafe { AppendMenuW(m, MF_STRING, CMD_EXIT as usize, w!("Exit AetherRS")) };
     let mb = *MENU_BMP.borrow();
     set_item_bitmap(m, CMD_SMALL as u32, false, mb[0]);
     set_item_bitmap(m, CMD_SEARCH as u32, false, mb[1]);

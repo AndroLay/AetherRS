@@ -1116,7 +1116,7 @@ pub fn desk_background_menu(pt: POINT) {
         let _ = AppendMenuW(hm, MF_STRING, 1, w!("Personalisasi"));
         let _ = AppendMenuW(hm, MF_STRING, 2, w!("Pengaturan layar"));
         let _ = AppendMenuW(hm, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(hm, MF_STRING, 3, w!("Menu Win12 Shell"));
+        let _ = AppendMenuW(hm, MF_STRING, 3, w!("Menu AetherRS"));
     }
     let c = track_shell_menu(hm, pt, nm.clone());
     let _ = unsafe { DestroyMenu(hm) };

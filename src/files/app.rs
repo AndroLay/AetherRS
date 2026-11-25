@@ -295,14 +295,14 @@ pub(crate) fn fm_refresh_chrome(w: &mut FmWin) {
             let _ = unsafe { DestroyIcon(HICON(prev.0 as *mut c_void)) };
         }
     }
-    // Judul: "Win12 Explorer", atau "<judul tab> - Win12 Explorer".
+    // Judul: "AetherRS Files", atau "<judul tab> - AetherRS Files".
     let mut buf = [0u16; 256];
-    copy_wide(&mut buf, &wide_z("Win12 Explorer"));
+    copy_wide(&mut buf, &wide_z("AetherRS Files"));
     if title[0] != 0 {
         let mut t = [0u16; 128];
         copy_wide(&mut t, &title);
         copy_wide(&mut buf, &t);
-        cat_wide(&mut buf, &wide_z(" - Win12 Explorer"));
+        cat_wide(&mut buf, &wide_z(" - AetherRS Files"));
     }
     let _ = unsafe { SetWindowTextW(h, crate::wide::pcw(&buf)) };
     fm_update_cue(w);

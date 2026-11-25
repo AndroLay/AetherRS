@@ -87,7 +87,7 @@ pub fn line(k: &str, pos_ms: i64) -> Option<String> {
 
 fn curl(args: &[String]) -> Option<String> {
     let out = Command::new("curl.exe")
-        .args(["-s", "-m", "10", "-G", "-H", "User-Agent: Win12Shell/1.0"])
+        .args(["-s", "-m", "10", "-G", "-H", "User-Agent: AetherRS/0.1"])
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()

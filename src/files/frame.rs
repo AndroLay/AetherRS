@@ -175,7 +175,7 @@ pub(crate) fn fm_open(path: Option<&str>, select: bool) -> Option<HWND> {
     let p: *mut FmWin = Box::into_raw(fm_win_new());
     WINS.borrow_mut()[slot] = p;
     let cls = to_wide_z(CLASS_FRAME);
-    let title = to_wide_z("Win12 Explorer");
+    let title = to_wide_z("AetherRS Files");
     let inst = fm_hinstance();
     // SAFETY: buffer UTF-16 lokal hidup selama panggilan; lpCreateParams = p (dibaca WM_NCCREATE).
     let created = unsafe {
@@ -542,9 +542,9 @@ fn fm_fallback_explorer(cmd: &str) {
     if !explorer_process_running() {
         // Shell Win12 tanpa Explorer: cadangan tidak bisa dipakai. Beri tahu pengguna, jangan gagal diam-diam.
         let text = to_wide_z(
-            "Win12 Explorer tidak dapat membuka lokasi itu. File Explorer Windows sedang tidak berjalan, jadi cadangannya tidak dipakai.",
+            "AetherRS Files tidak dapat membuka lokasi itu. File Explorer Windows sedang tidak berjalan, jadi cadangannya tidak dipakai.",
         );
-        let caption = to_wide_z("Win12 Explorer");
+        let caption = to_wide_z("AetherRS Files");
         // SAFETY: text dan caption berakhir NUL dan hidup selama pemanggilan.
         let _ = unsafe {
             MessageBoxW(None, pcw(&text), pcw(&caption), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST)

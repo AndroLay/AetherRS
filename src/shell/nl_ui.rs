@@ -124,7 +124,7 @@ fn nl_api_read_body(request: *mut c_void, body: &mut [u8]) -> Result<usize, i32>
 
 /// Bagian HTTP dari `NlApiFetch`: GET /v1/devices ke 127.0.0.1 dengan header Bearer, redirect dimatikan.
 fn nl_api_http_get(token: &NlJsonApiToken, devices: &mut NlJsonDeviceList) -> i32 {
-    let agent = to_wide_z("Win12Shell/1.0");
+    let agent = to_wide_z("AetherRS/0.1");
     let session = NlWinHttpHandle(unsafe {
         winhttp_open(pcw(&agent), NL_WH_ACCESS_NO_PROXY, PCWSTR::null(), PCWSTR::null(), 0)
     });

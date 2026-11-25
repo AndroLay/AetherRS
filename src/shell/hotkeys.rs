@@ -582,7 +582,7 @@ pub fn hk_need_explorer(target: String) {
          Beralih ke Windows biasa sekarang? Jendela app yang terbuka tetap ada, dan {name} dibuka setelah Explorer siap.\n\n\
          Kembali ke Win12 penuh nanti: Start > Win12 penuh, atau klik kanan dok > Beralih ke Win12 penuh."
     ));
-    let caption = to_wide_z("Win12 Shell");
+    let caption = to_wide_z("AetherRS");
     // SAFETY: text dan caption berakhir NUL dan hidup selama pemanggilan.
     let r = unsafe {
         MessageBoxW(
@@ -651,7 +651,7 @@ pub fn normal_switch_to_shell() {
          Jendela File Explorer yang terbuka ikut tertutup; jendela app lain tetap terbuka.\n\
          Kembali ke Windows biasa: Win+X > Beralih ke Windows biasa.\n\nLanjutkan?",
     );
-    let caption = to_wide_z("Win12 Shell");
+    let caption = to_wide_z("AetherRS");
     // SAFETY: text dan caption berakhir NUL dan hidup selama pemanggilan.
     let r = unsafe {
         MessageBoxW(
