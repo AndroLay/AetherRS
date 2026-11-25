@@ -31,7 +31,7 @@ use windows::Win32::UI::Shell::{
     ExplorerBrowser, IExplorerBrowser, IExplorerBrowserEvents, IExplorerBrowserEvents_Impl, IInputObject,
     IInputObject_Vtbl, IShellView, ILClone, ILFindLastID, ILRemoveLastID, SHGetFileInfoW, SHGetNameFromIDList,
     ShellExecuteW, EBO_ALWAYSNAVIGATE, EBO_NOBORDER, EBO_SHOWFRAMES, EXPLORER_BROWSER_OPTIONS, FOLDERSETTINGS,
-    FVM_DETAILS, SBSP_ABSOLUTE, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON,
+    FVM_DETAILS, SBSP_ABSOLUTE, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
     SIGDN_DESKTOPABSOLUTEEDITING, SIGDN_NORMALDISPLAY, SVSI_ENSUREVISIBLE, SVSI_FOCUSED, SVSI_SELECT,
     SVUIA_ACTIVATE_FOCUS,
 };
@@ -226,39 +226,22 @@ pub(crate) fn fm_focus_view(t: &mut FmTab) {
 // ---- tata letak (win12files.cpp:157-194) ----
 
 /// FmBodyRect (win12files.cpp:157-164): area isi tab di bawah bilah.
-fn fm_body_rect(h: HWND, dpi: i32) -> RECT {
-    let mut rc = rect0();
-    let _ = unsafe { GetClientRect(h, &mut rc) };
-    let top = px(FM_TABH_DIP + FM_NAVH_DIP + FM_CMDH_DIP, dpi);
-    if top < rc.bottom {
-        rc.top = top;
-    } else {
-        rc.top = rc.bottom;
-    }
-    rc
+/// Sejak 2026-11-18: di antara bilah atas dan bilah status bawah (chrome::body_rect).
+fn fm_body_rect(w: &FmWin) -> RECT {
+    crate::files::chrome::body_rect(w)
 }
 
 /// FmLayout (win12files.cpp:167-194): tata letak kotak alamat, pencarian, dan area tab.
 pub(crate) fn fm_layout(w: &mut FmWin) {
-    let dpi = dpi_of(w.h);
-    let mut rc = rect0();
-    let _ = unsafe { GetClientRect(w.h, &mut rc) };
-    let right = rc.right;
-    let nav_top = px(FM_TABH_DIP, dpi);
-    let nav_h = px(FM_NAVH_DIP, dpi);
-    let pad = px(4, dpi);
-    let btns = px(40, dpi) * 4;
-    let search_w = px(240, dpi);
-    let search_x = right - px(12, dpi) - search_w;
-    let addr_x = btns + pad * 2;
-    let addr_w = (search_x - px(8, dpi) - addr_x).max(0);
-    let edit_y = nav_top + pad;
-    let edit_h = nav_h - pad * 2;
+    // Kotak EDIT diletakkan di dalam kotak bulat yang digambar chrome.rs.
+    let g = crate::files::chrome::geo(w);
+    let ar = crate::files::chrome::edit_rect(&g, &crate::files::chrome::addr_box(&g), 8);
+    let sr = crate::files::chrome::edit_rect(&g, &crate::files::chrome::search_box(&g), 34);
     unsafe {
-        let _ = MoveWindow(w.addr, addr_x, edit_y, addr_w, edit_h, true);
-        let _ = MoveWindow(w.search, search_x, edit_y, search_w, edit_h, true);
+        let _ = MoveWindow(w.addr, ar.left, ar.top, ar.right - ar.left, ar.bottom - ar.top, true);
+        let _ = MoveWindow(w.search, sr.left, sr.top, sr.right - sr.left, sr.bottom - sr.top, true);
     }
-    let body = fm_body_rect(w.h, dpi);
+    let body = fm_body_rect(w);
     let active = w.tabs.active;
     for (i, t) in w.tab.iter_mut().enumerate() {
         if let Some(eb) = &t.eb {
@@ -266,6 +249,9 @@ pub(crate) fn fm_layout(w: &mut FmWin) {
             let _ = unsafe { eb.SetRect(None, r) };
         }
     }
+    crate::files::extras::term_layout(w);
+    // kolom Detail menyesuaikan lebar baru (ditunda agar tidak berulang selama seret ubah ukuran)
+    crate::files::viewstate::fill_soon(w.h);
 }
 
 // ---- judul, alamat, dan ikon (win12files.cpp:197-222) ----
@@ -309,17 +295,19 @@ pub(crate) fn fm_refresh_chrome(w: &mut FmWin) {
             let _ = unsafe { DestroyIcon(HICON(prev.0 as *mut c_void)) };
         }
     }
-    // Judul: "Win12 Files", atau "<judul tab> - Win12 Files".
+    // Judul: "Win12 Explorer", atau "<judul tab> - Win12 Explorer".
     let mut buf = [0u16; 256];
-    copy_wide(&mut buf, &wide_z("Win12 Files"));
+    copy_wide(&mut buf, &wide_z("Win12 Explorer"));
     if title[0] != 0 {
         let mut t = [0u16; 128];
         copy_wide(&mut t, &title);
         copy_wide(&mut buf, &t);
-        cat_wide(&mut buf, &wide_z(" - Win12 Files"));
+        cat_wide(&mut buf, &wide_z(" - Win12 Explorer"));
     }
     let _ = unsafe { SetWindowTextW(h, crate::wide::pcw(&buf)) };
     fm_update_cue(w);
+    crate::files::chrome::crumbs_refresh(w);
+    crate::files::extras::term_follow(w);
     fm_refresh_selection(w);
     let _ = unsafe { InvalidateRect(Some(h), None, false) };
 }
@@ -334,12 +322,44 @@ struct FmEvents {
 }
 
 impl IExplorerBrowserEvents_Impl for FmEvents_Impl {
-    fn OnNavigationPending(&self, _pidlfolder: *const ITEMIDLIST) -> windows::core::Result<()> {
+    fn OnNavigationPending(&self, pidlfolder: *const ITEMIDLIST) -> windows::core::Result<()> {
+        // Tampilan per folder: simpan folder yang ditinggalkan, siapkan mode folder tujuan (tersimpan atau bawaan
+        // jenis folder) sebelum tampilan barunya dibuat.
+        if let Some(w) = fm_win_of(HWND(self.hwnd as *mut c_void)) {
+            if let Some(pos) = tab_pos(w, self.id) {
+                let t = &mut w.tab[pos];
+                crate::files::viewstate::save(t);
+                let saved = crate::files::viewstate::key_of_pidl(pidlfolder).and_then(|k| crate::files::viewstate::load(&k));
+                let mode = saved
+                    .as_deref()
+                    .and_then(crate::files::viewstate::saved_mode)
+                    .unwrap_or(crate::files::viewstate::FVM_AUTO_U32);
+                t.vs_pending = saved;
+                if let Some(eb) = t.eb.as_ref() {
+                    let fs = FOLDERSETTINGS { ViewMode: mode, fFlags: crate::files::viewstate::FWF_NOHEADERINALLVIEWS_U32 };
+                    let _ = unsafe { eb.SetFolderSettings(&fs) };
+                }
+            }
+        }
         Ok(())
     }
 
     fn OnViewCreated(&self, psv: Ref<'_, IShellView>) -> windows::core::Result<()> {
         if let Some(sv) = psv.as_ref() {
+            if let Some(w) = fm_win_of(HWND(self.hwnd as *mut c_void)) {
+                if let Some(pos) = tab_pos(w, self.id) {
+                    if let Some(s) = w.tab[pos].vs_pending.take() {
+                        crate::files::viewstate::apply(sv, &s);
+                    }
+                }
+            }
+            // FOLDERSETTINGS.fFlags diabaikan IExplorerBrowser untuk header; pasang langsung di tampilan
+            // agar header kolom hanya muncul di Detail (seperti Explorer).
+            if let Ok(fv2) = sv.cast::<windows::Win32::UI::Shell::IFolderView2>() {
+                let f = crate::files::viewstate::FWF_NOHEADERINALLVIEWS_U32;
+                let _ = unsafe { fv2.SetCurrentFolderFlags(f, f) };
+            }
+            // thumbs.rs (gambar mini sendiri) nonaktif: butuh FVO_VISTALAYOUT yang dicabut (2026-11-19).
             let _ = unsafe { sv.UIActivate(SVUIA_ACTIVATE_FOCUS.0 as u32) };
         }
         Ok(())
@@ -382,6 +402,11 @@ pub(crate) fn fm_tab_empty() -> FmTab {
         hist_from: 0,
         sort,
         searching: false,
+        icon: -1,
+        vs_init: String::new(),
+        vs_pending: None,
+        fill_w: -1,
+        fill_extra: 0,
     }
 }
 
@@ -396,11 +421,18 @@ pub(crate) fn fm_tab_init(w: &mut FmWin, pos: usize) -> bool {
         Ok(e) => e,
         Err(_) => return false,
     };
-    let body = fm_body_rect(w.h, dpi_of(w.h));
+    // Situs panel Pratinjau/Detail dipasang sebelum Initialize (IExplorerPaneVisibility).
+    crate::files::extras::panes_attach(&eb);
+    let body = fm_body_rect(w);
+    // FVM_AUTO: folder memilih tampilan bawaan jenisnya (This PC = ubin drive, Gambar = ikon), seperti Explorer.
+    // Dulu FVM_DETAILS dipaksakan untuk semua folder (2026-11-19).
     let fs = FOLDERSETTINGS {
-        ViewMode: FVM_DETAILS.0 as u32,
-        fFlags: 0,
+        ViewMode: crate::files::viewstate::FVM_AUTO_U32,
+        // Header kolom hanya di tampilan Detail, seperti Explorer (dulu ikut muncul di tampilan ikon).
+        fFlags: crate::files::viewstate::FWF_NOHEADERINALLVIEWS_U32,
     };
+    // 2026-11-19: FVO_VISTALAYOUT (SysListView32, untuk thumbs.rs) dicoba lalu dicabut: pengguna menilai tampilannya
+    // jelek. Tampilan kembali DirectUI ItemsView bawaan Windows 11.
     if unsafe { eb.Initialize(w.h, &body, Some(&fs as *const FOLDERSETTINGS)) }.is_err() {
         return false;
     }
@@ -425,11 +457,13 @@ pub(crate) fn fm_tab_init(w: &mut FmWin, pos: usize) -> bool {
 
 /// FmTabDestroy: Unadvise dan Destroy IExplorerBrowser, bebaskan PIDL, lalu kosongkan tab.
 pub(crate) fn fm_tab_destroy(t: &mut FmTab) {
+    crate::files::viewstate::save(t); // tampilan folder terakhir tab ini
     if let Some(eb) = t.eb.take() {
         if t.cookie != 0 {
             let _ = unsafe { eb.Unadvise(t.cookie) };
         }
         let _ = unsafe { eb.Destroy() };
+        crate::files::extras::panes_detach(&eb);
         // eb dilepas di akhir blok (drop = pengganti Release).
     }
     free_pidl(t.cur);
@@ -457,6 +491,7 @@ fn fm_tab_navigated(w: &mut FmWin, id: i32, pidl: *const ITEMIDLIST) {
     };
     let active = w.tabs.active == pos as i32;
     let copy = unsafe { ILClone(pidl) };
+    let mut w_himl: isize = 0;
     {
         let t = &mut w.tab[pos];
         free_pidl(t.cur);
@@ -475,6 +510,22 @@ fn fm_tab_navigated(w: &mut FmWin, id: i32, pidl: *const ITEMIDLIST) {
             copy_wide(&mut t.title, &b);
             unsafe { CoTaskMemFree(Some(name.0 as *const c_void)) };
         }
+        // Ikon kecil tab dan breadcrumb: indeks image list sistem (image list milik sistem).
+        let mut sfi: SHFILEINFOW = unsafe { zeroed() }; // SAFETY: struct C POD; nol valid.
+        let flags = SHGFI_FLAGS(SHGFI_PIDL.0 | SHGFI_SYSICONINDEX.0 | SHGFI_SMALLICON.0);
+        let himl = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(pidl as *const u16),
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+                Some(&mut sfi),
+                size_of::<SHFILEINFOW>() as u32,
+                flags,
+            )
+        };
+        if himl != 0 {
+            t.icon = sfi.iIcon;
+            w_himl = himl as isize;
+        }
         // Item yang dipilih setelah naik ke induk (/select,).
         if !t.pending.is_null() {
             if let Some(sv) = fm_current_view(t) {
@@ -485,8 +536,19 @@ fn fm_tab_navigated(w: &mut FmWin, id: i32, pidl: *const ITEMIDLIST) {
             t.pending = null_mut();
         }
     }
+    if w_himl != 0 {
+        w.himl = w_himl;
+    }
+    // Keadaan awal folder ini (sesudah keadaan tersimpan diterapkan): disimpan saat pergi hanya bila berubah.
+    // Urutan tidak lagi dipaksakan per tab (fm_apply_sort): tiap folder memakai urutannya sendiri.
+    {
+        let t = &mut w.tab[pos];
+        t.vs_init = fm_current_view(t).and_then(|sv| crate::files::viewstate::capture(&sv)).unwrap_or_default();
+        t.fill_w = -1;
+        t.fill_extra = 0;
+    }
     if active {
-        fm_apply_sort(w);
+        crate::files::viewstate::fill_soon(w.h);
         fm_refresh_chrome(w);
     } else {
         let _ = unsafe { InvalidateRect(Some(w.h), None, false) };
@@ -581,6 +643,58 @@ pub(crate) fn fm_navigate_to(w: &mut FmWin, text: &str, select: bool) -> bool {
     }
     fm_status(w, "", false);
     true
+}
+
+/// Seperti bilah alamat Explorer: teks yang bukan lokasi dijalankan sebagai perintah (mis. `cmd`, `alacritty`,
+/// `notepad a.txt`) dengan folder aktif sebagai direktori kerja. Nama dicari Windows lewat PATH dan App Paths.
+pub(crate) fn fm_address_run(w: &mut FmWin, text: &str) -> bool {
+    use windows::Win32::UI::Shell::{
+        SHGetPathFromIDListW, ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    };
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let (file, params) = if let Some(rest) = t.strip_prefix('"') {
+        match rest.find('"') {
+            Some(i) => (rest[..i].to_string(), rest[i + 1..].trim().to_string()),
+            None => (rest.to_string(), String::new()),
+        }
+    } else {
+        match t.find(char::is_whitespace) {
+            Some(i) => (t[..i].to_string(), t[i..].trim().to_string()),
+            None => (t.to_string(), String::new()),
+        }
+    };
+    // Direktori kerja: folder aktif bila folder sistem berkas (bukan Ini PC, Beranda, dll.).
+    let mut dir = [0u16; 260];
+    let has_dir = match fm_active(w) {
+        Some(tab) if !tab.cur.is_null() => unsafe { SHGetPathFromIDListW(tab.cur, &mut dir) }.as_bool(),
+        _ => false,
+    };
+    let file_w = crate::wide::to_wide_z(&file);
+    let params_w = crate::wide::to_wide_z(&params);
+    let mut sei: SHELLEXECUTEINFOW = unsafe { zeroed() }; // SAFETY: struct C POD; nol valid.
+    sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+    sei.hwnd = w.h;
+    sei.lpFile = crate::wide::pcw(&file_w);
+    if !params.is_empty() {
+        sei.lpParameters = crate::wide::pcw(&params_w);
+    }
+    if has_dir {
+        sei.lpDirectory = PCWSTR(dir.as_ptr());
+    }
+    sei.nShow = SW_SHOWNORMAL.0;
+    let ok = unsafe { ShellExecuteExW(&mut sei) }.is_ok();
+    if ok {
+        fm_status(w, "", false);
+        // Kembalikan alamat ke folder aktif (teks perintah dibuang, seperti Explorer).
+        fm_refresh_chrome(w);
+    } else {
+        fm_status(w, &format!("Windows tidak dapat menemukan '{}'", t), true);
+    }
+    ok
 }
 
 /// FmNavigate: buka teks alamat tanpa pemilihan item.

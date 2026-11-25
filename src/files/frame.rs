@@ -51,6 +51,13 @@ use crate::wide::{from_wide, pcw, to_wide, to_wide_z};
 // win12files.cpp:621-639. GetCommandLineW dipanggil lewat crate windows (fitur Win32_System_Environment aktif di Cargo.toml).
 
 /// Nilai awal FmWin (pengganti ZeroMemory + inisialisasi di C++). Dikemas Box lalu dipasang lewat into_raw.
+/// Ukuran awal jendela dalam piksel untuk DPI sistem (1100x720 DIP).
+fn px_sys(dip: i32) -> i32 {
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as i32;
+    let dpi = if dpi > 0 { dpi } else { 96 };
+    dip * dpi / 96
+}
+
 fn fm_win_new() -> Box<FmWin> {
     Box::new(FmWin {
         h: HWND(null_mut()),
@@ -72,6 +79,19 @@ fn fm_win_new() -> Box<FmWin> {
         tracking: false,
         has_sel: false,
         search_gen: 0,
+        font: windows::Win32::Graphics::Gdi::HFONT(null_mut()),
+        himl: 0,
+        editing: false,
+        crumbs: Vec::new(),
+        crumb_rects: Vec::new(),
+        n_items: 0,
+        n_sel: 0,
+        details: true,
+        term: HWND::default(),
+        term_on: false,
+        term_h: crate::files::state::FM_TERMH_DIP,
+        split_drag: false,
+        chev_rects: Vec::new(),
     })
 }
 
@@ -155,7 +175,7 @@ pub(crate) fn fm_open(path: Option<&str>, select: bool) -> Option<HWND> {
     let p: *mut FmWin = Box::into_raw(fm_win_new());
     WINS.borrow_mut()[slot] = p;
     let cls = to_wide_z(CLASS_FRAME);
-    let title = to_wide_z("Win12 Files");
+    let title = to_wide_z("Win12 Explorer");
     let inst = fm_hinstance();
     // SAFETY: buffer UTF-16 lokal hidup selama panggilan; lpCreateParams = p (dibaca WM_NCCREATE).
     let created = unsafe {
@@ -166,8 +186,8 @@ pub(crate) fn fm_open(path: Option<&str>, select: bool) -> Option<HWND> {
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1100,
-            720,
+            px_sys(1100),
+            px_sys(720),
             None,
             None,
             Some(inst),
@@ -249,11 +269,8 @@ pub(crate) fn fm_command(w: &mut FmWin, cmd: i32, tab_n: i32) {
         W12FA_UP => fm_nav_up(w),
         W12FA_REFRESH => fm_nav_refresh(w),
         W12FA_FOCUS_ADDRESS => {
-            // SAFETY: w.addr adalah edit yang dibuat WM_CREATE; dipanggil dari thread UI.
-            unsafe {
-                let _ = SetFocus(Some(w.addr));
-                let _ = SendMessageW(w.addr, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
-            }
+            // Kotak alamat masuk mode ketik (EDIT tampil di atas breadcrumb, teks terpilih).
+            crate::files::chrome::addr_edit(w, true);
         }
         W12FA_FOCUS_SEARCH => {
             // SAFETY: w.search adalah edit yang dibuat WM_CREATE; dipanggil dari thread UI.
@@ -313,10 +330,62 @@ fn fm_handle_key(msg: &MSG) -> bool {
     let in_addr = msg.hwnd == w.addr;
     let in_search = msg.hwnd == w.search;
     let in_edit = in_addr || in_search;
+    let (ctrl, shift, alt) = (key_down(VK_CONTROL.0), key_down(VK_SHIFT.0), key_down(VK_MENU.0));
+    let plain = !ctrl && !shift && !alt;
+
+    // Panel terminal F4: semua tombol untuk shell, kecuali F4 (sembunyikan), Ctrl+` (pindah fokus), Alt+F4 (tutup jendela).
+    if !w.term.0.is_null() && msg.hwnd == w.term {
+        if vk == 0x73 && plain {
+            crate::files::extras::term_toggle(w);
+            return true;
+        }
+        if vk == 0xC0 && ctrl && !alt {
+            crate::files::extras::term_focus_toggle(w);
+            return true;
+        }
+        if vk == 0x73 && alt {
+            // SAFETY: memposting perintah tutup ke jendela frame milik proses ini.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(w.h),
+                    windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+                    WPARAM(windows::Win32::UI::WindowsAndMessaging::SC_CLOSE as usize),
+                    LPARAM(0),
+                );
+            }
+            return true;
+        }
+        return false;
+    }
+    // Sejak 2026-11-19: F4 = panel terminal (seperti Dolphin). Alamat tetap lewat Alt+D / Ctrl+L.
+    if vk == 0x73 && plain {
+        crate::files::extras::term_toggle(w);
+        return true;
+    }
+    if vk == 0xC0 && ctrl && !alt && !shift {
+        crate::files::extras::term_focus_toggle(w);
+        return true;
+    }
+    // Alt+P panel pratinjau, Alt+Shift+P panel detail (Explorer).
+    if vk == 'P' as u32 && alt && !ctrl {
+        crate::files::extras::pane_toggle(w, shift);
+        return true;
+    }
+    // Ctrl+Shift+T: buka ulang tab yang ditutup (seperti peramban).
+    if vk == 'T' as u32 && ctrl && shift && !alt {
+        crate::files::bar::fm_reopen_closed_tab(w);
+        return true;
+    }
+    // Ctrl+Shift+C: salin jalur (Explorer "Salin sebagai jalur").
+    if vk == 'C' as u32 && ctrl && shift && !alt && !in_edit {
+        crate::files::extras::copy_path(w);
+        return true;
+    }
 
     if in_addr && vk == VK_RETURN.0 as u32 {
         let text = fm_window_text(w.addr);
-        if fm_navigate_to(w, &text, false) {
+        // Lokasi dulu; bila bukan lokasi, jalankan sebagai perintah (cmd, alacritty, ...) seperti Explorer.
+        if fm_navigate_to(w, &text, false) || crate::files::app::fm_address_run(w, &text) {
             if let Some(t) = fm_active(w) {
                 fm_focus_view(t);
             }
@@ -325,6 +394,9 @@ fn fm_handle_key(msg: &MSG) -> bool {
     }
     if in_addr && vk == VK_ESCAPE.0 as u32 {
         fm_refresh_chrome(w);
+        if let Some(t) = fm_active(w) {
+            fm_focus_view(t);
+        }
         return true;
     }
     if in_search && vk == VK_RETURN.0 as u32 {
@@ -362,23 +434,68 @@ fn fm_handle_key(msg: &MSG) -> bool {
     }
 }
 
+/// Tombol samping mouse (XBUTTON1 = Kembali, XBUTTON2 = Maju) di mana pun dalam jendela, seperti Explorer.
+/// Ditangani di pompa pesan karena pesan masuk ke jendela anak (DefView, pohon navigasi) yang tidak meneruskannya.
+fn fm_handle_xbutton(msg: &MSG) -> bool {
+    const WM_XBUTTONDOWN: u32 = 0x020B;
+    const WM_XBUTTONUP: u32 = 0x020C;
+    const WM_XBUTTONDBLCLK: u32 = 0x020D;
+    const WM_NCXBUTTONDOWN: u32 = 0x00AB;
+    const WM_NCXBUTTONUP: u32 = 0x00AC;
+    const WM_NCXBUTTONDBLCLK: u32 = 0x00AD;
+    let m = msg.message;
+    if !matches!(m, WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK | WM_NCXBUTTONDOWN | WM_NCXBUTTONUP | WM_NCXBUTTONDBLCLK) {
+        return false;
+    }
+    // SAFETY: GetAncestor hanya membaca HWND dari pesan yang sedang diproses.
+    let root = unsafe { GetAncestor(msg.hwnd, GA_ROOT) };
+    let Some(w) = fm_win_of(root) else {
+        return false;
+    };
+    if m == WM_XBUTTONUP || m == WM_NCXBUTTONUP {
+        match (msg.wParam.0 >> 16) & 0xFFFF {
+            1 => crate::files::bar::fm_hist_go(w, -1),
+            2 => crate::files::bar::fm_hist_go(w, 1),
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// FmRunLoop (win12files.cpp:694-702): pompa pesan utama. Berhenti bila GetMessageW mengembalikan nilai <= 0.
 fn fm_run_loop() {
     // SAFETY: MSG adalah struct POD; dinolkan sebelum dipakai GetMessageW.
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MsgWaitForMultipleObjectsEx, PeekMessageW, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_QUIT,
+    };
     let mut msg: MSG = unsafe { zeroed() };
+    // Selain pesan, tunggu juga handle pantau folder (watch.rs) agar penghapusan/pembuatan berkas langsung tampil.
     loop {
-        // SAFETY: msg adalah buffer lokal yang hidup selama pemanggilan.
-        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if r.0 <= 0 {
-            break;
+        let hs = crate::files::watch::sync();
+        // SAFETY: hs hidup selama pemanggilan; tanpa batas waktu (INFINITE).
+        let r = unsafe { MsgWaitForMultipleObjectsEx(Some(&hs), u32::MAX, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+        if r.0 == u32::MAX {
+            // WAIT_FAILED (handle tidak sah): jangan berputar memakan CPU; tunggu pesan berikutnya saja.
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::WaitMessage() };
         }
-        if fm_handle_key(&msg) {
+        let i = r.0 as usize;
+        if i < hs.len() {
+            crate::files::watch::fired(hs[i]);
             continue;
         }
-        // SAFETY: msg berisi pesan yang baru diambil GetMessageW.
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            let _ = DispatchMessageW(&msg);
+        // SAFETY: msg adalah buffer lokal yang hidup selama pemanggilan.
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            if msg.message == WM_QUIT {
+                return;
+            }
+            if fm_handle_xbutton(&msg) || fm_handle_key(&msg) {
+                continue;
+            }
+            // SAFETY: msg berisi pesan yang baru diambil PeekMessageW.
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                let _ = DispatchMessageW(&msg);
+            }
         }
     }
 }
@@ -394,7 +511,12 @@ pub(crate) fn fm_open_from_command_line(cmd: &str) -> bool {
 
 /// Apakah proses `explorer.exe` sedang berjalan (snapshot proses).
 /// PORT: Win12 mendaftarkan kelas `Shell_TrayWnd` sendiri (core_c3.rs, core_c4b.rs), jadi jendela itu tidak bisa dipakai sebagai penanda Explorer.
-fn explorer_process_running() -> bool {
+pub(crate) fn explorer_process_running() -> bool {
+    process_running("explorer.exe")
+}
+
+/// Apakah proses bernama `exe` (tanpa membedakan huruf besar/kecil) sedang berjalan.
+pub(crate) fn process_running(exe: &str) -> bool {
     // SAFETY: snapshot proses dibuat, dibaca, lalu ditutup dalam fungsi ini.
     let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
         return false;
@@ -404,7 +526,7 @@ fn explorer_process_running() -> bool {
     let mut found = false;
     let mut ok = unsafe { Process32FirstW(snap, &mut pe) }.is_ok();
     while ok {
-        if from_wide(&pe.szExeFile).eq_ignore_ascii_case("explorer.exe") {
+        if from_wide(&pe.szExeFile).eq_ignore_ascii_case(exe) {
             found = true;
             break;
         }
@@ -420,9 +542,9 @@ fn fm_fallback_explorer(cmd: &str) {
     if !explorer_process_running() {
         // Shell Win12 tanpa Explorer: cadangan tidak bisa dipakai. Beri tahu pengguna, jangan gagal diam-diam.
         let text = to_wide_z(
-            "Win12 Files tidak dapat membuka lokasi itu. Explorer sedang tidak berjalan, jadi cadangan Explorer tidak dipakai.",
+            "Win12 Explorer tidak dapat membuka lokasi itu. File Explorer Windows sedang tidak berjalan, jadi cadangannya tidak dipakai.",
         );
-        let caption = to_wide_z("Win12 Files");
+        let caption = to_wide_z("Win12 Explorer");
         // SAFETY: text dan caption berakhir NUL dan hidup selama pemanggilan.
         let _ = unsafe {
             MessageBoxW(None, pcw(&text), pcw(&caption), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST)
@@ -471,7 +593,12 @@ pub fn fm_main() -> i32 {
     // SAFETY: dipanggil sekali di awal proses, sebelum jendela apa pun dibuat.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Satu grup dengan File Explorer di taskbar (Win12 dan Windows): ID aplikasi sama dengan Explorer.
+        let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::w!(
+            "Microsoft.Windows.Explorer"
+        ));
     }
+    crate::files::extras::pane_settings_load();
     let icc = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_WIN95_CLASSES,

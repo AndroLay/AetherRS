@@ -3,8 +3,14 @@
 
 pub mod app;
 pub mod bar;
+pub mod chrome;
+pub mod extras;
 pub mod frame;
 pub mod model;
 pub mod search_ui;
 pub mod state;
+pub mod term;
+pub mod thumbs;
+pub mod viewstate;
+pub mod watch;
 pub mod wndproc;

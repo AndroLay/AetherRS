@@ -10,10 +10,12 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, DeleteObject, EndPaint, GetStockObject, InvalidateRect, SetBkColor, SetTextColor, DEFAULT_GUI_FONT, HDC,
     HGDIOBJ, PAINTSTRUCT,
 };
+use windows::Win32::Graphics::Dwm::DwmDefWindowProc;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, KillTimer, PostQuitMessage, SendMessageW, SetWindowPos, CREATESTRUCTW,
+    CreateWindowExW, DefWindowProcW, ShowWindow, EN_KILLFOCUS, EN_SETFOCUS, SWP_FRAMECHANGED, SWP_NOMOVE,
+    SWP_NOSIZE, SW_HIDE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_COMMAND, SetTimer, WM_NCCALCSIZE, WM_NCHITTEST, DestroyIcon, KillTimer, PostQuitMessage, SendMessageW, SetWindowPos, CREATESTRUCTW,
     ES_AUTOHSCROLL, HICON, HMENU, ICON_SMALL, SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_STYLE, WM_COPYDATA, WM_CREATE,
     WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER,
@@ -36,7 +38,7 @@ fn make_edit(parent: HWND, id: usize, inst: HINSTANCE) -> Option<HWND> {
     // SAFETY: buffer UTF-16 lokal hidup selama panggilan; parent berasal dari sistem.
     let created = unsafe {
         CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            WINDOW_EX_STYLE(0),
             pcw(&cls),
             pcw(&empty),
             style,
@@ -72,16 +74,28 @@ fn on_create(h: HWND) -> LRESULT {
         w.addr = addr;
         w.search = search;
     }
-    // SAFETY: GetStockObject mengembalikan handle stok sistem.
-    let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+    // Segoe UI 9 pt seperti Explorer; dihapus di WM_NCDESTROY.
+    let font = crate::files::chrome::ui_font(dpi_of(h));
+    if let Some(w) = fm_win_of(h) {
+        w.font = font;
+    }
     // SAFETY: addr dan search baru dibuat di atas dan masih valid.
     unsafe {
         let _ = SendMessageW(addr, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(0)));
         let _ = SendMessageW(search, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(0)));
     }
+    // Kotak alamat mulai sebagai breadcrumb; EDIT tampil saat diklik atau Ctrl+L.
+    unsafe {
+        let _ = ShowWindow(addr, SW_HIDE);
+    }
     if let Some(w) = fm_win_of(h) {
         fm_init_bar(w);
     }
+    // Tab di bilah judul: hitung ulang area non-klien lalu perluas bingkai DWM.
+    unsafe {
+        let _ = SetWindowPos(h, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    crate::files::chrome::extend_frame(h);
     LRESULT(0)
 }
 
@@ -91,16 +105,11 @@ fn on_size(h: HWND, lp: LPARAM) -> LRESULT {
         Some(w) => fm_layout(w),
         None => return LRESULT(0),
     }
-    let dpi = dpi_of(h);
-    let bar = RECT {
-        left: 0,
-        top: 0,
-        right: (lp.0 & 0xFFFF) as i32,
-        bottom: px(FM_TABH_DIP + FM_NAVH_DIP + FM_CMDH_DIP, dpi),
-    };
-    // SAFETY: bar hidup selama panggilan; h adalah jendela frame.
+    let _ = lp;
+    crate::files::chrome::extend_frame(h);
+    // Bilah atas dan bilah status ikut berubah; anak jendela dikecualikan (WS_CLIPCHILDREN).
     unsafe {
-        let _ = InvalidateRect(Some(h), Some(&bar as *const RECT), false);
+        let _ = InvalidateRect(Some(h), None, false);
     }
     LRESULT(0)
 }
@@ -122,6 +131,18 @@ fn on_dpi_changed(h: HWND, lp: LPARAM) -> LRESULT {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+    }
+    if let Some(w) = fm_win_of(h) {
+        let font = crate::files::chrome::ui_font(dpi_of(h));
+        unsafe {
+            let _ = SendMessageW(w.addr, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            let _ = SendMessageW(w.search, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            if !w.font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(w.font.0));
+            }
+        }
+        w.font = font;
+        fm_layout(w);
     }
     LRESULT(0)
 }
@@ -149,7 +170,7 @@ fn on_ctl_color_edit(h: HWND, wp: WPARAM) -> Option<LRESULT> {
     }
     let hdc = HDC(wp.0 as *mut c_void);
     let text = fm_rgb(w.pal.text);
-    let panel = fm_rgb(w.pal.panel);
+    let panel = fm_rgb(crate::files::chrome::box_color(w.dark));
     // SAFETY: wp berisi HDC yang diberikan sistem untuk WM_CTLCOLOREDIT.
     unsafe {
         let _ = SetTextColor(hdc, text);
@@ -184,6 +205,12 @@ fn on_destroy(h: HWND) -> LRESULT {
 /// WM_NCDESTROY: lepas FmWin dan kuas edit. Bila jendela terakhir, keluar dari loop pesan.
 fn on_nc_destroy(h: HWND) -> Option<LRESULT> {
     if let Some(boxed) = fm_take_by_hwnd(h) {
+        if !boxed.font.0.is_null() {
+            // SAFETY: font dibuat on_create/on_dpi_changed dan hanya dilepas di sini.
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(boxed.font.0));
+            }
+        }
         if !boxed.edit_brush.0.is_null() {
             // SAFETY: kuas dibuat oleh FmInitBar dan hanya dilepas di sini.
             unsafe {
@@ -203,6 +230,28 @@ fn on_nc_destroy(h: HWND) -> Option<LRESULT> {
 
 /// WM_TIMER: segarkan pilihan bila timer pilihan (FM_TIMER_SEL) berbunyi.
 fn on_timer(h: HWND, wp: WPARAM) -> LRESULT {
+    if wp.0 == FM_TIMER_TRIM {
+        let _ = unsafe { KillTimer(Some(h), FM_TIMER_TRIM) };
+        fm_trim();
+        return LRESULT(0);
+    }
+    if wp.0 == crate::files::watch::FM_TIMER_WATCH {
+        if let Some(w) = fm_win_of(h) {
+            crate::files::watch::on_timer(w);
+        } else {
+            let _ = unsafe { KillTimer(Some(h), crate::files::watch::FM_TIMER_WATCH) };
+        }
+        return LRESULT(0);
+    }
+    if wp.0 == crate::files::viewstate::FM_TIMER_FILL {
+        let _ = unsafe { KillTimer(Some(h), crate::files::viewstate::FM_TIMER_FILL) };
+        if let Some(w) = fm_win_of(h) {
+            if let Some(t) = crate::files::app::fm_active(w) {
+                crate::files::viewstate::fill_columns(t);
+            }
+        }
+        return LRESULT(0);
+    }
     if wp.0 == FM_TIMER_SEL {
         if let Some(w) = fm_win_of(h) {
             fm_refresh_selection(w);
@@ -222,9 +271,79 @@ fn on_search_done(h: HWND, lp: LPARAM) -> LRESULT {
     LRESULT(0)
 }
 
+const FM_TIMER_TRIM: usize = 7;
+
+/// Lepas working set proses win12files (SetProcessWorkingSetSize -1,-1 = EmptyWorkingSet).
+fn fm_trim() {
+    use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+    let _ = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+}
+
+/// WM_COMMAND dari kotak EDIT: alamat kehilangan fokus = kembali ke breadcrumb; fokus pencarian = garis aksen.
+fn on_command(h: HWND, wp: WPARAM) {
+    let id = (wp.0 & 0xFFFF) as u32;
+    let code = ((wp.0 >> 16) & 0xFFFF) as u32;
+    let Some(w) = fm_win_of(h) else {
+        return;
+    };
+    if id == 101 && code == EN_KILLFOCUS {
+        crate::files::chrome::addr_edit(w, false);
+    } else if id == 102 && (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
+        unsafe {
+            let _ = InvalidateRect(Some(h), None, false);
+        }
+    }
+}
+
 /// Window proc frame file manager (FmWndProc, win12files.cpp:518-618).
 pub unsafe extern "system" fn fm_wnd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Tombol jendela (min/maks/tutup) digambar dan diuji DWM di area bingkai yang diperluas.
+    // Klik tombol jendela ditangani sendiri (DwmDefWindowProc tidak selalu mengenalinya, lihat caption_button_at).
+    if matches!(msg, 0x00A1..=0x00A3) {
+        // WM_NCLBUTTONDOWN / WM_NCLBUTTONUP / WM_NCLBUTTONDBLCLK
+        if let Some(r) = crate::files::chrome::nc_caption_button(h, msg, wp) {
+            return r;
+        }
+    }
+    match msg {
+        // WM_NCMOUSEMOVE: sorot tombol di bawah kursor; WM_NCMOUSELEAVE dilacak (TME_NONCLIENT).
+        0x00A0 => {
+            crate::files::chrome::cap_set_hot(h, wp.0 as u32);
+            let mut tme = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                cbSize: size_of::<windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT>() as u32,
+                dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE
+                    | windows::Win32::UI::Input::KeyboardAndMouse::TME_NONCLIENT,
+                hwndTrack: h,
+                dwHoverTime: 0,
+            };
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut tme);
+        }
+        // WM_NCMOUSELEAVE, atau kursor masuk ke area klien.
+        0x02A2 | 0x0200 => crate::files::chrome::cap_set_hot(h, 0),
+        WM_TIMER if wp.0 == crate::files::chrome::FM_TIMER_CAP => {
+            crate::files::chrome::cap_tick(h);
+            return LRESULT(0);
+        }
+        // WM_ACTIVATE / WM_NCACTIVATE: glyph meredup saat jendela tidak aktif.
+        0x0006 | 0x0086 => crate::files::chrome::cap_refresh(h),
+        WM_NCDESTROY => crate::files::chrome::cap_forget(h),
+        _ => {}
+    }
+    let mut dwm = LRESULT(0);
+    if DwmDefWindowProc(h, msg, wp, lp, &mut dwm).as_bool() {
+        return dwm;
+    }
     let handled: Option<LRESULT> = match msg {
+        WM_NCCALCSIZE => crate::files::chrome::nc_calcsize(h, wp, lp),
+        WM_NCHITTEST => Some(crate::files::chrome::nc_hittest(h, wp, lp)),
+        WM_ACTIVATE => {
+            crate::files::chrome::extend_frame(h);
+            None
+        }
+        WM_COMMAND => {
+            on_command(h, wp);
+            None
+        }
         WM_NCCREATE => {
             // lpCreateParams = FmWin* yang dipasang FmOpen sebelum CreateWindowExW.
             let cs = lp.0 as *const CREATESTRUCTW;
@@ -239,18 +358,107 @@ pub unsafe extern "system" fn fm_wnd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_CREATE => Some(on_create(h)),
         WM_NCDESTROY => on_nc_destroy(h),
         WM_DESTROY => Some(on_destroy(h)),
-        WM_SIZE => Some(on_size(h, lp)),
+        WM_SIZE => {
+            if wp.0 == 1 {
+                // SIZE_MINIMIZED: lepas working set (halaman kembali dimuat saat dipakai lagi).
+                fm_trim();
+            }
+            Some(on_size(h, lp))
+        }
+        WM_ACTIVATEAPP => {
+            // Tidak aktif 30 dtk -> working set dilepas; aktif lagi -> batalkan.
+            if wp.0 == 0 {
+                let _ = SetTimer(Some(h), FM_TIMER_TRIM, 30_000, None);
+            } else {
+                let _ = KillTimer(Some(h), FM_TIMER_TRIM);
+            }
+            None
+        }
         WM_DPICHANGED => Some(on_dpi_changed(h, lp)),
         WM_ERASEBKGND => Some(LRESULT(1)),
         WM_PAINT => Some(on_paint(h)),
         WM_CTLCOLOREDIT => on_ctl_color_edit(h, wp),
-        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MBUTTONDOWN | WM_MOUSEMOVE | WM_MOUSELEAVE => {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MBUTTONDOWN | WM_MOUSEMOVE | WM_MOUSELEAVE | 0x0205 => {
             if let Some(w) = fm_win_of(h) {
                 fm_mouse(w, msg, lp);
             }
             Some(LRESULT(0))
         }
         MSG_SEARCH_DONE => Some(on_search_done(h, lp)),
+        // Menu "Baru" asli: ikon dan isi submenu dari IContextMenu3 selama menu terbuka.
+        0x0117 | 0x002B | 0x002C | 0x0120 => crate::files::extras::menu_msg(msg, wp, lp),
+        crate::files::term::WM_FM_TERM_CWD => {
+            if lp.0 != 0 {
+                // SAFETY: pengirim (term.rs osc_done) menyerahkan Box<String> lewat LPARAM.
+                let path: String = *unsafe { Box::from_raw(lp.0 as *mut String) };
+                if let Some(w) = fm_win_of(h) {
+                    crate::files::extras::term_cwd(w, &path);
+                }
+            }
+            Some(LRESULT(0))
+        }
+        crate::files::term::WM_FM_TERM_CLOSED => {
+            if let Some(w) = fm_win_of(h) {
+                crate::files::extras::term_closed(w, HWND(lp.0 as *mut c_void));
+            }
+            Some(LRESULT(0))
+        }
+        // Tombol browser keyboard/mouse (WM_APPCOMMAND): Kembali, Maju, Segarkan, Cari, Beranda.
+        0x0319 => {
+            let cmd = ((lp.0 as usize >> 16) & 0x0FFF) as u32;
+            match fm_win_of(h) {
+                Some(w) => match cmd {
+                    1 => {
+                        crate::files::bar::fm_hist_go(w, -1);
+                        Some(LRESULT(1))
+                    }
+                    2 => {
+                        crate::files::bar::fm_hist_go(w, 1);
+                        Some(LRESULT(1))
+                    }
+                    3 => {
+                        crate::files::frame::fm_command(w, crate::fm_logic::W12FA_REFRESH, -1);
+                        Some(LRESULT(1))
+                    }
+                    5 => {
+                        crate::files::frame::fm_command(w, crate::fm_logic::W12FA_FOCUS_SEARCH, -1);
+                        Some(LRESULT(1))
+                    }
+                    7 => {
+                        crate::files::bar::fm_navigate_home(w);
+                        Some(LRESULT(1))
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        }
+        // Kursor ubah ukuran di atas pembatas panel terminal.
+        0x0020 => {
+            let hit_client = (lp.0 & 0xFFFF) as u32 == 1;
+            match fm_win_of(h) {
+                Some(w) if hit_client && wp.0 as isize == h.0 as isize => {
+                    let mut pt = windows::Win32::Foundation::POINT::default();
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(h, &mut pt);
+                    let hit = crate::files::chrome::hit_test(w, pt.x, pt.y);
+                    if hit.kind == crate::files::state::FM_HIT_SPLIT
+                        || w.press.kind == crate::files::state::FM_HIT_SPLIT
+                    {
+                        if let Ok(c) = windows::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                            None,
+                            windows::Win32::UI::WindowsAndMessaging::IDC_SIZENS,
+                        ) {
+                            windows::Win32::UI::WindowsAndMessaging::SetCursor(Some(c));
+                        }
+                        Some(LRESULT(1))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
         WM_TIMER => Some(on_timer(h, wp)),
         _ => None,
     };

@@ -7,7 +7,7 @@ use std::ptr::null_mut;
 use windows::core::{Interface, BOOL, GUID, PCSTR, PCWSTR, PSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT, PROPERTYKEY, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetColorizationColor, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmGetColorizationColor, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::Graphics::Gdi::{
     BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
@@ -32,11 +32,11 @@ use windows::Win32::UI::Shell::{
     FOLDERID_Profile, ILClone, ILRemoveLastID, IContextMenu, IFolderView, IFolderView2, IShellView, BHID_SFUIObject,
     CMF_NORMAL, CMINVOKECOMMANDINFO, FVM_DETAILS, FVM_ICON, FVM_LIST, FVM_TILE, GCS_VERBW, SBSP_ABSOLUTE,
     SHGetKnownFolderIDList, SHGetValueW, SORTCOLUMN, SORT_ASCENDING, SORT_DESCENDING, SVGIO_BACKGROUND,
-    SVGIO_SELECTION,
+    SVGIO_SELECTION, SVGIO_ALLVIEW, SVSI_SELECT, FOLDERVIEWMODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DestroyWindow, GetClientRect, GetMenuItemCount, GetMenuItemInfoW,
-    SendMessageW, CreateWindowExW, SetTimer, CW_USEDEFAULT, HMENU, MENUITEMINFOW, MF_CHECKED, MF_STRING, MIIM_ID,
+    SendMessageW, CreateWindowExW, SetTimer, CW_USEDEFAULT, HMENU, MENUITEMINFOW, MF_CHECKED, MF_GRAYED, MF_STRING, MIIM_ID,
     MIIM_SUBMENU, SW_SHOWNORMAL, TrackPopupMenu, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WINDOW_STYLE,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -46,9 +46,9 @@ use crate::files::app::{
     fm_tab_destroy, fm_tab_empty, fm_tab_init, fm_tab_navigation_failed, free_pidl,
 };
 use crate::files::state::{
-    FmGeo, FmHit, FmTab, FmWin, CMD_DIP, CMD_LABEL, CMD_TIP, FM_CMDH_DIP, FM_HIT_CMD, FM_HIT_NAV, FM_HIT_NONE,
-    FM_HIT_PLUS, FM_HIT_TAB, FM_HIT_TABCLOSE, FM_HISTMAX, FM_NAVH_DIP, FM_TABH_DIP, FM_TIMER_SEL, FM_TOOL_ID, HOME_ADDRESS, NAV_TIP,
-    SORT_LABEL, VIEW_LABEL,
+    FmHit, FmTab, FmWin, FM_HIT_ADDR, FM_HIT_CHEV, FM_HIT_CMD, FM_HIT_CRUMB, FM_HIT_SPLIT, FM_HIT_TERMBTN, FM_HIT_NAV, FM_HIT_NONE, FM_HIT_VIEWBTN,
+    FM_HIT_PLUS, FM_HIT_TAB, FM_HIT_TABCLOSE, FM_HISTMAX, FM_TIMER_SEL, FM_TOOL_ID, HOME_ADDRESS, SORT_LABEL,
+    VIEW_LABEL,
 };
 use crate::fm_logic::{
     w12_fm_palette_for, w12_fm_tab_close_hit, w12_fm_tab_slot_at, w12_fm_tab_width, w12_fm_theme_is_dark,
@@ -56,6 +56,7 @@ use crate::fm_logic::{
     w12_hist_push, w12_tabs_add, w12_tabs_close, w12_tabs_move, W12FC_COPY, W12FC_COUNT, W12FC_CUT, W12FC_DELETE,
     W12FC_NEWFOLDER, W12FC_PASTE, W12FC_RENAME, W12FC_SORT, W12FC_VIEW,
 };
+use crate::files::chrome;
 use crate::wide::{pcw, to_wide, to_wide_z};
 
 // ---- util (sama dengan app.rs; fungsi privat di sana, jadi disalin di sini) ----
@@ -106,158 +107,6 @@ fn fm_no_hit() -> FmHit {
     FmHit { kind: FM_HIT_NONE, index: -1 }
 }
 
-// ---- geometri (w12fm_bar.inc:22-75) ----
-
-/// FmGeoOf: geometri bilah dalam piksel untuk DPI jendela.
-fn fm_geo_of(w: &FmWin) -> FmGeo {
-    let dpi = dpi_of(w.h);
-    let tab_h = px(FM_TABH_DIP, dpi);
-    let nav_h = px(FM_NAVH_DIP, dpi);
-    let cmd_top = tab_h + nav_h;
-    FmGeo {
-        tab_h,
-        nav_top: tab_h,
-        nav_h,
-        cmd_top,
-        cmd_h: px(FM_CMDH_DIP, dpi),
-        plus_w: px(36, dpi),
-        nav_btn_w: px(40, dpi),
-        close_size: px(16, dpi),
-        close_pad: px(8, dpi),
-        pad: px(4, dpi),
-    }
-}
-
-/// FmTabW: lebar satu tab. Tanpa tab, 200 DIP.
-fn fm_tab_w(w: &FmWin, g: &FmGeo, cw: i32) -> i32 {
-    let dpi = dpi_of(w.h);
-    if w.tabs.n < 1 {
-        return px(200, dpi);
-    }
-    w12_fm_tab_width(w.tabs.n, cw - g.plus_w, px(80, dpi), px(200, dpi))
-}
-
-/// FmCmdRect: kotak tombol perintah ke-c pada baris perintah.
-fn fm_cmd_rect(w: &FmWin, g: &FmGeo, c: usize) -> RECT {
-    let dpi = dpi_of(w.h);
-    let mut left = px(8, dpi);
-    for &dip in CMD_DIP.iter().take(c) {
-        left += px(dip, dpi) + g.pad;
-    }
-    RECT {
-        left,
-        top: g.cmd_top + g.pad,
-        right: left + px(CMD_DIP[c], dpi),
-        bottom: g.cmd_top + g.cmd_h - g.pad,
-    }
-}
-
-/// FmNavRect: kotak tombol navigasi ke-i.
-fn fm_nav_rect(g: &FmGeo, i: i32) -> RECT {
-    RECT {
-        left: i * g.nav_btn_w,
-        top: g.nav_top,
-        right: (i + 1) * g.nav_btn_w,
-        bottom: g.nav_top + g.nav_h,
-    }
-}
-
-// ---- uji titik dan sorotan (w12fm_bar.inc:76-149) ----
-
-/// FmHitTest: uji titik klien pada tab, tombol x, "+", navigasi, dan perintah.
-fn fm_hit_test(w: &FmWin, x: i32, y: i32) -> FmHit {
-    let mut hit = fm_no_hit();
-    if y < 0 {
-        return hit;
-    }
-    let rc = client_rect(w.h);
-    let g = fm_geo_of(w);
-    if y < g.tab_h {
-        let n = w.tabs.n;
-        let tab_w = fm_tab_w(w, &g, rc.right);
-        let slot = w12_fm_tab_slot_at(x, n, tab_w, g.plus_w);
-        if slot < 0 {
-            return hit;
-        }
-        if slot == n {
-            hit.kind = FM_HIT_PLUS;
-            return hit;
-        }
-        hit.index = slot;
-        hit.kind = if w12_fm_tab_close_hit(x, slot * tab_w, tab_w, g.close_size, g.close_pad) {
-            FM_HIT_TABCLOSE
-        } else {
-            FM_HIT_TAB
-        };
-        return hit;
-    }
-    if y < g.cmd_top {
-        if x >= 0 && x < 4 * g.nav_btn_w {
-            hit.kind = FM_HIT_NAV;
-            hit.index = x / g.nav_btn_w;
-        }
-        return hit;
-    }
-    if y < g.cmd_top + g.cmd_h {
-        for c in 0..W12FC_COUNT {
-            let r = fm_cmd_rect(w, &g, c);
-            if x >= r.left && x < r.right {
-                hit.kind = FM_HIT_CMD;
-                hit.index = c as i32;
-                break;
-            }
-        }
-    }
-    hit
-}
-
-/// FmSlotAtX: indeks tab di bawah x pada baris tab (untuk seret). -1 bila di luar baris tab.
-fn fm_slot_at_x(w: &FmWin, x: i32, y: i32) -> i32 {
-    let g = fm_geo_of(w);
-    if y < 0 || y >= g.tab_h {
-        return -1;
-    }
-    let rc = client_rect(w.h);
-    w12_fm_tab_slot_at(x, w.tabs.n, fm_tab_w(w, &g, rc.right), g.plus_w)
-}
-
-/// FmUpdateTip: perbarui teks tooltip untuk sorotan `hit` (satu alat untuk seluruh klien).
-fn fm_update_tip(w: &FmWin, hit: FmHit) {
-    if w.tip.0.is_null() {
-        return;
-    }
-    let text: &str = match hit.kind {
-        FM_HIT_NAV => NAV_TIP[hit.index as usize],
-        FM_HIT_CMD => CMD_TIP[hit.index as usize],
-        FM_HIT_PLUS => "Tab baru",
-        FM_HIT_TABCLOSE => "Tutup tab",
-        _ => "",
-    };
-    let mut buf = to_wide_z(text);
-    let ti = TTTOOLINFOW {
-        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
-        hwnd: w.h,
-        uId: FM_TOOL_ID,
-        lpszText: PWSTR(buf.as_mut_ptr()),
-        ..Default::default()
-    };
-    unsafe {
-        SendMessageW(w.tip, TTM_UPDATETIPTEXTW, None, Some(LPARAM(&ti as *const TTTOOLINFOW as isize)));
-    }
-}
-
-/// FmSetHot: ganti sorotan kursor; memperbarui tooltip dan menggambar ulang.
-fn fm_set_hot(w: &mut FmWin, hit: FmHit) {
-    if hit == w.hot {
-        return;
-    }
-    w.hot = hit;
-    fm_update_tip(w, hit);
-    unsafe {
-        let _ = InvalidateRect(Some(w.h), None, false);
-    }
-}
-
 /// FmMoveTab: pindahkan entri tab dari `from` ke `to`. Urutan sama dengan memmove di C.
 /// FmTab tidak Copy (memegang IExplorerBrowser), jadi memakai rotate, bukan salinan.
 fn fm_move_tab(w: &mut FmWin, from: i32, to: i32) {
@@ -279,15 +128,28 @@ fn fm_move_tab(w: &mut FmWin, from: i32, to: i32) {
 pub(crate) fn fm_refresh_selection(w: &mut FmWin) {
     // Ada item terpilih di tampilan tab aktif: IFolderView::ItemCount(SVGIO_SELECTION) > 0.
     let mut has = false;
+    let (mut n_sel, mut n_all, mut details) = (0, 0, w.details);
     if let Some(t) = fm_active(w) {
         if let Some(fv) = fm_current_view(t).and_then(|sv| sv.cast::<IFolderView>().ok()) {
             if let Ok(n) = unsafe { fv.ItemCount(SVGIO_SELECTION) } {
                 has = n > 0;
+                n_sel = n;
+            }
+            n_all = unsafe { fv.ItemCount(SVGIO_ALLVIEW) }.unwrap_or(0);
+            if let Ok(fv2) = fv.cast::<IFolderView2>() {
+                let mut vm = FOLDERVIEWMODE(0);
+                let mut sz = 0i32;
+                if unsafe { fv2.GetViewModeAndIconSize(&mut vm, &mut sz) }.is_ok() {
+                    details = vm == FVM_DETAILS;
+                }
             }
         }
     }
-    if has != w.has_sel {
+    if has != w.has_sel || n_sel != w.n_sel || n_all != w.n_items || details != w.details {
         w.has_sel = has;
+        w.n_sel = n_sel;
+        w.n_items = n_all;
+        w.details = details;
         let _ = unsafe { InvalidateRect(Some(w.h), None, false) };
     }
 }
@@ -442,11 +304,128 @@ pub(crate) fn fm_new_tab(w: &mut FmWin) {
     fm_activate_tab(w);
 }
 
+// ---- menu klik kanan tab (2026-11-24) ----
+
+thread_local! {
+    /// Lokasi tab yang ditutup (terbaru di akhir), untuk "Buka ulang tab yang ditutup" (Ctrl+Shift+T).
+    static CLOSED_TABS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Alamat parsing tab (jalur berkas atau shell:::{..}); None bila tab belum punya lokasi.
+fn fm_tab_path(w: &FmWin, index: i32) -> Option<String> {
+    use windows::Win32::UI::Shell::{SHGetNameFromIDList, SIGDN_DESKTOPABSOLUTEPARSING};
+    let t = w.tab.get(usize::try_from(index).ok()?)?;
+    if t.cur.is_null() {
+        return None;
+    }
+    // SAFETY: pidl tab valid; string dibebaskan CoTaskMemFree.
+    unsafe {
+        let s = SHGetNameFromIDList(t.cur, SIGDN_DESKTOPABSOLUTEPARSING).ok()?;
+        let out = String::from_utf16_lossy(s.as_wide());
+        windows::Win32::System::Com::CoTaskMemFree(Some(s.0 as *const std::ffi::c_void));
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// Tab baru yang langsung membuka `path`.
+fn fm_new_tab_at(w: &mut FmWin, path: &str) {
+    let before = w.tabs.n;
+    fm_new_tab(w);
+    if w.tabs.n > before {
+        crate::files::app::fm_navigate_to(w, path, false);
+    }
+}
+
+/// Ctrl+Shift+T / menu tab: buka lagi tab terakhir yang ditutup.
+pub(crate) fn fm_reopen_closed_tab(w: &mut FmWin) {
+    match CLOSED_TABS.with(|c| c.borrow_mut().pop()) {
+        Some(p) => fm_new_tab_at(w, &p),
+        None => fm_status(w, "Tidak ada tab yang baru ditutup", false),
+    }
+}
+
+/// Menu klik kanan tab, seperti Explorer Windows 11 (ditambah buka ulang tab yang ditutup).
+fn fm_tab_menu(w: &mut FmWin, index: i32, x: i32, y: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR;
+    let n = w.tabs.n;
+    let path = fm_tab_path(w, index);
+    let has_closed = CLOSED_TABS.with(|c| !c.borrow().is_empty());
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
+    let add = |id: usize, label: &str, on: bool| {
+        let t = to_wide_z(label);
+        let f = if on { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = unsafe { AppendMenuW(menu, f, id, pcw(&t)) };
+    };
+    let sep = || {
+        let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    };
+    add(1, "Tab baru\tCtrl+T", true);
+    add(2, "Duplikat tab", path.is_some());
+    add(3, "Pindahkan ke jendela baru", path.is_some());
+    sep();
+    add(4, "Tutup tab\tCtrl+W", true);
+    add(5, "Tutup tab lain", n > 1);
+    add(6, "Tutup tab di sebelah kanan", index < n - 1);
+    sep();
+    add(7, "Buka ulang tab yang ditutup\tCtrl+Shift+T", has_closed);
+    let mut pt = POINT { x, y };
+    let _ = unsafe { ClientToScreen(w.h, &mut pt) };
+    let id = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, None, w.h, None) }.0;
+    let _ = unsafe { DestroyMenu(menu) };
+    match id {
+        1 => fm_new_tab(w),
+        2 => {
+            if let Some(p) = path {
+                fm_new_tab_at(w, &p);
+            }
+        }
+        3 => {
+            if let Some(p) = path {
+                if crate::files::frame::fm_open(Some(&p), false).is_some() {
+                    // Jendela baru sudah terbuka: tab asal ditutup (bisa menutup jendela ini bila tab terakhir).
+                    fm_close_tab(w, index);
+                    return;
+                }
+                fm_status(w, "Jendela baru tidak dapat dibuka", true);
+            }
+        }
+        4 => {
+            fm_close_tab(w, index);
+            return;
+        }
+        5 => {
+            for j in (index + 1..n).rev() {
+                fm_close_tab(w, j);
+            }
+            for j in (0..index).rev() {
+                fm_close_tab(w, j);
+            }
+        }
+        6 => {
+            for j in (index + 1..n).rev() {
+                fm_close_tab(w, j);
+            }
+        }
+        7 => fm_reopen_closed_tab(w),
+        _ => {}
+    }
+    let _ = unsafe { InvalidateRect(Some(w.h), None, false) };
+}
+
 /// FmCloseTab (w12fm_bar.inc:296).
 pub(crate) fn fm_close_tab(w: &mut FmWin, index: i32) {
     let n = w.tabs.n;
     if index < 0 || index >= n {
         return;
+    }
+    if let Some(p) = fm_tab_path(w, index) {
+        CLOSED_TABS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() >= 20 {
+                c.remove(0);
+            }
+            c.push(p);
+        });
     }
     let idx = index as usize;
     let last = (n - 1) as usize;
@@ -663,6 +642,9 @@ pub(crate) fn fm_init_bar(w: &mut FmWin) {
     };
     w.dark = w12_fm_theme_is_dark(theme_arg, system_light != 0);
     w.pal = w12_fm_palette_for(w.dark);
+    if !w.term.0.is_null() {
+        crate::files::term::term_set_dark(w.term, w.dark);
+    }
 
     // Aksen: RGB(0, 120, 212) bila warna aksen tidak terbaca. ARGB dari DWM diubah ke COLORREF.
     w.accent = COLORREF(0x00D4_7800);
@@ -676,13 +658,22 @@ pub(crate) fn fm_init_bar(w: &mut FmWin) {
 
     // Kegagalan atribut DWM diabaikan, sama seperti C.
     let dark_attr = BOOL(w.dark as i32);
-    let backdrop: i32 = 2; // DWMSBT_MAINWINDOW (Mica); gagal di Windows lama diabaikan
+    // Tanpa Mica: baris tab digambar warna solid; area tombol jendela memakai warna bilah judul yang sama.
+    let backdrop: i32 = 1; // DWMSBT_NONE
+    let cap = chrome::caption_color(w.dark);
+    let cap_ref = fm_rgb(cap);
     unsafe {
         let _ = DwmSetWindowAttribute(
             w.h,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark_attr as *const BOOL as *const c_void,
             std::mem::size_of::<BOOL>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            w.h,
+            DWMWA_CAPTION_COLOR,
+            &cap_ref as *const COLORREF as *const c_void,
+            std::mem::size_of::<COLORREF>() as u32,
         );
         let _ = DwmSetWindowAttribute(
             w.h,
@@ -695,7 +686,7 @@ pub(crate) fn fm_init_bar(w: &mut FmWin) {
     if !w.edit_brush.0.is_null() {
         let _ = unsafe { DeleteObject(HGDIOBJ(w.edit_brush.0)) };
     }
-    w.edit_brush = unsafe { CreateSolidBrush(fm_rgb(w.pal.panel)) };
+    w.edit_brush = unsafe { CreateSolidBrush(fm_rgb(chrome::box_color(w.dark))) };
     if w.dark {
         fm_dark_shell(w);
     }
@@ -730,7 +721,7 @@ pub(crate) fn fm_init_bar(w: &mut FmWin) {
                 left: 0,
                 top: 0,
                 right: 32767,
-                bottom: px(FM_TABH_DIP + FM_NAVH_DIP + FM_CMDH_DIP, dpi_of(w.h)),
+                bottom: 32767,
             },
             lpszText: PWSTR(empty_text.as_mut_ptr()),
             ..Default::default()
@@ -745,288 +736,13 @@ pub(crate) fn fm_init_bar(w: &mut FmWin) {
     }
 }
 
-/// Garis solid dengan pena sementara (FmLine, w12fm_bar.inc).
-fn fm_line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, c: COLORREF, pw: i32) {
-    unsafe {
-        let pen = CreatePen(PS_SOLID, pw, c);
-        if pen.0.is_null() {
-            return;
-        }
-        let old = SelectObject(dc, HGDIOBJ(pen.0));
-        let _ = MoveToEx(dc, x1, y1, None);
-        let _ = LineTo(dc, x2, y2);
-        let _ = SelectObject(dc, old);
-        let _ = DeleteObject(HGDIOBJ(pen.0));
-    }
-}
-
-/// Isi persegi dengan warna solid (FmFill).
-fn fm_fill(dc: HDC, r: &RECT, c: COLORREF) {
-    unsafe {
-        let brush = CreateSolidBrush(c);
-        if brush.0.is_null() {
-            return;
-        }
-        let _ = FillRect(dc, r, brush);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-    }
-}
-
-/// Teks satu baris; font dipilih lalu dipulihkan (FmText).
-fn fm_text(dc: HDC, r: &RECT, s: &mut [u16], c: COLORREF, font: HFONT, fmt: DRAW_TEXT_FORMAT) {
-    let mut rr = *r;
-    unsafe {
-        let old = SelectObject(dc, HGDIOBJ(font.0));
-        let _ = SetTextColor(dc, c);
-        let _ = SetBkMode(dc, TRANSPARENT);
-        let _ = DrawTextW(dc, s, &mut rr, fmt | DT_SINGLELINE | DT_NOPREFIX);
-        let _ = SelectObject(dc, old);
-    }
-}
-
-/// Silang × di dalam persegi (FmCross).
-fn fm_cross(dc: HDC, r: &RECT, c: COLORREF, pw: i32) {
-    let ins = (r.right - r.left) / 4;
-    fm_line(dc, r.left + ins, r.top + ins, r.right - ins, r.bottom - ins, c, pw);
-    fm_line(dc, r.right - ins, r.top + ins, r.left + ins, r.bottom - ins, c, pw);
-}
-
-/// Tanda plus (FmPlus).
-fn fm_plus(dc: HDC, r: &RECT, c: COLORREF, s: i32, pw: i32) {
-    let cx = (r.left + r.right) / 2;
-    let cy = (r.top + r.bottom) / 2;
-    fm_line(dc, cx - s, cy, cx + s, cy, c, pw);
-    fm_line(dc, cx, cy - s, cx, cy + s, c, pw);
-}
-
-/// Panah navigasi: 0 kembali, 1 maju, 2 naik (FmNavIcon).
-fn fm_nav_icon(dc: HDC, r: &RECT, kind: i32, c: COLORREF, s: i32, pw: i32) {
-    let cx = (r.left + r.right) / 2;
-    let cy = (r.top + r.bottom) / 2;
-    let hs = s / 2;
-    if kind == 2 {
-        fm_line(dc, cx, cy - s, cx, cy + s, c, pw);
-        fm_line(dc, cx, cy - s, cx - hs, cy - hs, c, pw);
-        fm_line(dc, cx, cy - s, cx + hs, cy - hs, c, pw);
-        return;
-    }
-    let dir = if kind == 0 { -1 } else { 1 };
-    fm_line(dc, cx - s, cy, cx + s, cy, c, pw);
-    fm_line(dc, cx + dir * s, cy, cx + dir * hs, cy - hs, c, pw);
-    fm_line(dc, cx + dir * s, cy, cx + dir * hs, cy + hs, c, pw);
-}
-
-/// Kursor segitiga untuk tombol Urutkan dan Tampilan (FmCaret).
-fn fm_caret(dc: HDC, cx: i32, cy: i32, s: i32, c: COLORREF) {
-    let pts = [
-        POINT { x: cx - s, y: cy - s / 2 },
-        POINT { x: cx + s, y: cy - s / 2 },
-        POINT { x: cx, y: cy + s / 2 },
-    ];
-    unsafe {
-        let brush = CreateSolidBrush(c);
-        if brush.0.is_null() {
-            return;
-        }
-        let old_b = SelectObject(dc, HGDIOBJ(brush.0));
-        let old_p = SelectObject(dc, GetStockObject(NULL_PEN));
-        let _ = Polygon(dc, &pts);
-        let _ = SelectObject(dc, old_p);
-        let _ = SelectObject(dc, old_b);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-    }
-}
-
-/// Font GDI dari ukuran poin pada DPI tertentu (FmFont).
-fn fm_font(dpi: i32, pt: i32, face: &str) -> HFONT {
-    let name = to_wide_z(face);
-    unsafe {
-        CreateFontW(
-            -mul_div(pt, dpi, 72),
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            pcw(&name),
-        )
-    }
-}
-
-/// Judul tab; kosong menjadi "Tab baru" seperti di C.
-fn tab_title(t: &FmTab) -> Vec<u16> {
-    let n = t.title.iter().position(|&c| c == 0).unwrap_or(t.title.len());
-    if n == 0 {
-        to_wide("Tab baru")
-    } else {
-        t.title[..n].to_vec()
-    }
-}
-
-/// Baris tab: latar, garis aksen, tombol ×, judul, dan tombol "+" (FmPaintTabs).
-fn fm_paint_tabs(w: &FmWin, dc: HDC, g: &FmGeo, cw: i32, font: HFONT, dpi: i32) {
-    let p = w.pal;
-    let n = w.tabs.n.clamp(0, w.tab.len() as i32);
-    let tab_w = fm_tab_w(w, g, cw);
-    for i in 0..n {
-        let r = RECT { left: i * tab_w, top: 0, right: (i + 1) * tab_w, bottom: g.tab_h };
-        let active = i == w.tabs.active;
-        let hot = w.hot.kind == FM_HIT_TAB && w.hot.index == i;
-        let pressed = w.press.kind == FM_HIT_TAB && w.press.index == i;
-        let bg = if active {
-            p.panel
-        } else if pressed {
-            p.press
-        } else if hot {
-            p.hover
-        } else {
-            p.bg
-        };
-        fm_fill(dc, &r, fm_rgb(bg));
-        if active {
-            let under = RECT { left: r.left, top: r.bottom - px(2, dpi), right: r.right, bottom: r.bottom };
-            fm_fill(dc, &under, w.accent);
-        }
-        let cs = g.close_size;
-        let cright = r.right - g.close_pad;
-        let ctop = (g.tab_h - cs) / 2;
-        let cr = RECT { left: cright - cs, top: ctop, right: cright, bottom: ctop + cs };
-        if w.hot.kind == FM_HIT_TABCLOSE && w.hot.index == i {
-            fm_fill(dc, &cr, fm_rgb(p.press));
-        }
-        fm_cross(dc, &cr, fm_rgb(p.text), px(1, dpi));
-        let tr = RECT { left: r.left + g.pad * 2, top: 0, right: cr.left - g.pad, bottom: g.tab_h };
-        let mut title = tab_title(&w.tab[i as usize]);
-        fm_text(dc, &tr, &mut title, fm_rgb(p.text), font, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-    }
-    let pr = RECT { left: n * tab_w, top: 0, right: n * tab_w + g.plus_w, bottom: g.tab_h };
-    if w.press.kind == FM_HIT_PLUS {
-        fm_fill(dc, &pr, fm_rgb(p.press));
-    } else if w.hot.kind == FM_HIT_PLUS {
-        fm_fill(dc, &pr, fm_rgb(p.hover));
-    }
-    fm_plus(dc, &pr, fm_rgb(p.text), px(5, dpi), px(1, dpi));
-}
-
-/// Tombol navigasi: kembali, maju, naik, segarkan (FmPaintNav).
-fn fm_paint_nav(w: &FmWin, dc: HDC, g: &FmGeo, icon_font: HFONT, enabled: [bool; 4], dpi: i32) {
-    let p = w.pal;
-    for i in 0..4 {
-        let r = fm_nav_rect(g, i);
-        let hot = w.hot.kind == FM_HIT_NAV && w.hot.index == i;
-        let pressed = w.press.kind == FM_HIT_NAV && w.press.index == i;
-        if hot && pressed {
-            fm_fill(dc, &r, fm_rgb(p.press));
-        } else if hot {
-            fm_fill(dc, &r, fm_rgb(p.hover));
-        }
-        let c = fm_rgb(if enabled[i as usize] { p.text } else { p.dim });
-        if i == 3 {
-            // Glyph Segarkan (U+E72C) dari Segoe MDL2 Assets.
-            let mut glyph = to_wide("\u{E72C}");
-            fm_text(dc, &r, &mut glyph, c, icon_font, DT_CENTER | DT_VCENTER);
-        } else {
-            fm_nav_icon(dc, &r, i, c, px(5, dpi), px(1, dpi));
-        }
-    }
-}
-
-/// Tombol perintah bilah beserta kursornya (FmPaintCmd).
-fn fm_paint_cmd(w: &FmWin, dc: HDC, g: &FmGeo, font: HFONT, dpi: i32) {
-    let p = w.pal;
-    for c in 0..W12FC_COUNT {
-        let idx = c as i32;
-        let r = fm_cmd_rect(w, g, c);
-        let hot = w.hot.kind == FM_HIT_CMD && w.hot.index == idx;
-        let pressed = w.press.kind == FM_HIT_CMD && w.press.index == idx;
-        if hot && pressed {
-            fm_fill(dc, &r, fm_rgb(p.press));
-        } else if hot {
-            fm_fill(dc, &r, fm_rgb(p.hover));
-        }
-        let enabled = w12_fm_cmd_enabled(idx, w.has_sel);
-        let tc = fm_rgb(if enabled { p.text } else { p.dim });
-        let caret = idx == W12FC_SORT || idx == W12FC_VIEW;
-        let right = if caret { r.right - px(18, dpi) } else { r.right - g.pad * 2 };
-        let tr = RECT { left: r.left + g.pad * 2, top: r.top, right, bottom: r.bottom };
-        let mut label = to_wide(CMD_LABEL[c]);
-        fm_text(dc, &tr, &mut label, tc, font, DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
-        if caret {
-            fm_caret(dc, r.right - px(10, dpi), (r.top + r.bottom) / 2, px(3, dpi), tc);
-        }
-    }
-}
-
-/// Teks status di kanan bilah perintah (FmPaintStatus).
-fn fm_paint_status(w: &FmWin, dc: HDC, g: &FmGeo, cw: i32, font: HFONT, dpi: i32) {
-    let n = w.status.iter().position(|&c| c == 0).unwrap_or(w.status.len());
-    if n == 0 {
-        return;
-    }
-    let last = fm_cmd_rect(w, g, W12FC_COUNT - 1);
-    let sr = RECT {
-        left: last.right + px(12, dpi),
-        top: g.cmd_top,
-        right: cw - g.pad * 2,
-        bottom: g.cmd_top + g.cmd_h,
-    };
-    if sr.right <= sr.left {
-        return;
-    }
-    // Merah = RGB(0xD1, 0x34, 0x38) bila status galat.
-    let c = if w.status_error { fm_rgb(0xD13438) } else { fm_rgb(w.pal.text) };
-    let mut s = w.status[..n].to_vec();
-    fm_text(dc, &sr, &mut s, c, font, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-}
-
-/// Gambar bilah lewat bitmap memori lalu salin ke DC (FmPaint).
+/// Gambar bilah (chrome.rs, gaya File Explorer Windows 11).
 pub(crate) fn fm_paint(w: &mut FmWin, dc: HDC) {
-    let cw = client_rect(w.h).right;
-    let g = fm_geo_of(w);
-    let bar_h = g.cmd_top + g.cmd_h;
-    if cw <= 0 || bar_h <= 0 {
-        return;
-    }
-    let dpi = dpi_of(w.h);
     let (can_back, can_fwd) = match fm_active(w) {
         Some(t) => (w12_hist_can_back(&t.hist), w12_hist_can_forward(&t.hist)),
         None => (false, false),
     };
-    let mem = unsafe { CreateCompatibleDC(Some(dc)) };
-    if mem.0.is_null() {
-        return;
-    }
-    let bmp = unsafe { CreateCompatibleBitmap(dc, cw, bar_h) };
-    if bmp.0.is_null() {
-        let _ = unsafe { DeleteDC(mem) };
-        return;
-    }
-    let old_bmp = unsafe { SelectObject(mem, HGDIOBJ(bmp.0)) };
-    let font = fm_font(dpi, 9, "Segoe UI");
-    let icon_font = fm_font(dpi, 12, "Segoe MDL2 Assets");
-    let all = RECT { left: 0, top: 0, right: cw, bottom: bar_h };
-    fm_fill(mem, &all, fm_rgb(w.pal.bg));
-    fm_paint_tabs(w, mem, &g, cw, font, dpi);
-    fm_paint_nav(w, mem, &g, icon_font, [can_back, can_fwd, true, true], dpi);
-    fm_paint_cmd(w, mem, &g, font, dpi);
-    fm_paint_status(w, mem, &g, cw, font, dpi);
-    let sep = RECT { left: 0, top: bar_h - 1, right: cw, bottom: bar_h };
-    fm_fill(mem, &sep, fm_rgb(w.pal.hover));
-    unsafe {
-        let _ = BitBlt(dc, 0, 0, cw, bar_h, Some(mem), 0, 0, SRCCOPY);
-        let _ = SelectObject(mem, old_bmp);
-        let _ = DeleteObject(HGDIOBJ(font.0));
-        let _ = DeleteObject(HGDIOBJ(icon_font.0));
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(mem);
-    }
+    chrome::paint(w, dc, [can_back, can_fwd, true, true]);
 }
 
 /// Tetikus bilah (FmMouse, w12fm_bar.inc:750-840): sorotan, tekan-lepas, seret tab,
@@ -1047,11 +763,14 @@ pub(crate) fn fm_mouse(w: &mut FmWin, msg: u32, lp: LPARAM) {
                 let _ = unsafe { TrackMouseEvent(&mut tme) };
                 w.tracking = true;
             }
-            let hit = fm_hit_test(w, x, y);
-            fm_set_hot(w, hit);
+            let hit = chrome::hit_test(w, x, y);
+            chrome::set_hot(w, hit);
+            if w.press.kind == FM_HIT_SPLIT {
+                crate::files::extras::split_drag(w, y);
+            }
             if w.press.kind == FM_HIT_TAB {
                 // Seret: tukar posisi tab dengan slot di bawah kursor.
-                let slot = fm_slot_at_x(w, x, y);
+                let slot = chrome::slot_at_x(w, x, y);
                 let from = w.drag_tab;
                 if slot >= 0 && slot < w.tabs.n && slot != from {
                     w12_tabs_move(&mut w.tabs, from, slot);
@@ -1065,25 +784,34 @@ pub(crate) fn fm_mouse(w: &mut FmWin, msg: u32, lp: LPARAM) {
         }
         WM_MOUSELEAVE => {
             w.tracking = false;
-            fm_set_hot(w, fm_no_hit());
+            chrome::set_hot(w, fm_no_hit());
         }
         WM_LBUTTONDOWN => {
-            let hit = fm_hit_test(w, x, y);
+            let hit = chrome::hit_test(w, x, y);
             fm_press_hit(w, hit);
         }
         WM_LBUTTONDBLCLK => {
             // Klik kedua datang sebagai pesan ini (CS_DBLCLKS).
-            let hit = fm_hit_test(w, x, y);
-            if hit.kind == FM_HIT_NONE && y < fm_geo_of(w).tab_h {
+            let hit = chrome::hit_test(w, x, y);
+            if hit.kind == FM_HIT_NONE && y < chrome::geo(w).tab_h {
                 fm_new_tab(w);
+            } else if hit.kind == FM_HIT_SPLIT {
+                crate::files::extras::split_reset(w);
             } else {
                 fm_press_hit(w, hit);
             }
         }
         WM_LBUTTONUP => fm_lbutton_up(w, x, y),
+        0x0205 => {
+            // WM_RBUTTONUP: menu tab.
+            let hit = chrome::hit_test(w, x, y);
+            if hit.kind == FM_HIT_TAB || hit.kind == FM_HIT_TABCLOSE {
+                fm_tab_menu(w, hit.index, x, y);
+            }
+        }
         WM_MBUTTONDOWN => {
             // Klik tengah pada tab = tutup tab.
-            let hit = fm_hit_test(w, x, y);
+            let hit = chrome::hit_test(w, x, y);
             if hit.kind == FM_HIT_TAB || hit.kind == FM_HIT_TABCLOSE {
                 fm_close_tab(w, hit.index);
             }
@@ -1100,14 +828,14 @@ fn fm_press_hit(w: &mut FmWin, hit: FmHit) {
     if hit.kind != FM_HIT_NONE {
         let _ = unsafe { SetCapture(w.h) };
     }
-    fm_set_hot(w, hit);
+    chrome::set_hot(w, hit);
     let _ = unsafe { InvalidateRect(Some(w.h), None, false) };
 }
 
 /// Lepas tombol kiri: beraksi hanya bila dilepas di atas tombol yang sama dengan saat ditekan.
 fn fm_lbutton_up(w: &mut FmWin, x: i32, y: i32) {
     let press = w.press;
-    let hit = fm_hit_test(w, x, y);
+    let hit = chrome::hit_test(w, x, y);
     let cap = unsafe { GetCapture() };
     if cap.0 == w.h.0 {
         let _ = unsafe { ReleaseCapture() };
@@ -1143,6 +871,22 @@ fn fm_lbutton_up(w: &mut FmWin, x: i32, y: i32) {
             _ => fm_nav_refresh(w),
         },
         FM_HIT_CMD => fm_bar_command(w, hit.index),
+        FM_HIT_CRUMB => chrome::crumb_go(w, hit.index),
+        FM_HIT_CHEV => {
+            let r = w.chev_rects.iter().find(|(k, _)| *k == hit.index).map(|(_, r)| *r);
+            if let Some(r) = r {
+                crate::files::extras::chevron_menu(w, hit.index, r);
+            }
+        }
+        FM_HIT_TERMBTN => crate::files::extras::term_toggle(w),
+        FM_HIT_ADDR => {
+            chrome::addr_edit(w, true);
+            return;
+        }
+        FM_HIT_VIEWBTN => {
+            fm_apply_view(w, if hit.index == 0 { 0 } else { 3 });
+            fm_refresh_selection(w);
+        }
         _ => {}
     }
     let _ = unsafe { InvalidateRect(Some(w.h), None, false) };
@@ -1150,11 +894,20 @@ fn fm_lbutton_up(w: &mut FmWin, x: i32, y: i32) {
 
 /// Perintah tombol bilah bila tersedia (FmBarCommand).
 fn fm_bar_command(w: &mut FmWin, c: i32) {
+    if c == chrome::CMD_MORE {
+        let r = chrome::cmd_rect(w, c as usize);
+        crate::files::extras::more_menu(w, r);
+        let _ = unsafe { InvalidateRect(Some(w.h), None, false) };
+        return;
+    }
     if c < 0 || (c as usize) >= W12FC_COUNT || !w12_fm_cmd_enabled(c, w.has_sel) {
         return;
     }
     match c {
-        W12FC_NEWFOLDER => fm_run_verb(w, true, &to_wide("NewFolder")),
+        W12FC_NEWFOLDER => {
+            let r = chrome::cmd_rect(w, c as usize);
+            crate::files::extras::new_menu(w, r);
+        }
         W12FC_CUT => fm_run_verb(w, false, &to_wide("cut")),
         W12FC_COPY => fm_run_verb(w, false, &to_wide("copy")),
         W12FC_PASTE => fm_run_verb(w, true, &to_wide("paste")),
@@ -1179,8 +932,7 @@ fn fm_popup(w: &FmWin, c: i32, labels: &[&str], checked: i32, base: i32) -> i32 
         let text = to_wide_z(label);
         let _ = unsafe { AppendMenuW(menu, flags, (base + i) as usize, pcw(&text)) };
     }
-    let g = fm_geo_of(w);
-    let r = fm_cmd_rect(w, &g, c as usize);
+    let r = chrome::cmd_rect(w, c as usize);
     let mut pt = POINT { x: r.left, y: r.bottom };
     let _ = unsafe { ClientToScreen(w.h, &mut pt) };
     let cmd = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, None, w.h, None) }.0;
@@ -1188,33 +940,172 @@ fn fm_popup(w: &FmWin, c: i32, labels: &[&str], checked: i32, base: i32) -> i32 
     cmd
 }
 
+// Menu "Lainnya" pindah ke extras::more_menu (2026-11-19).
+
 /// Menu urutkan kolom; pilihan langsung diterapkan ke folder aktif (FmBarCommand SORT).
+/// 2026-11-24: seperti Explorer Windows 11, ditambah Naik/Turun dan submenu "Kelompokkan menurut" (IFolderView2::SetGroupBy).
 fn fm_sort_menu(w: &mut FmWin) {
-    let cur = match fm_active(w) {
-        Some(t) => t.sort.col,
-        None => return,
-    };
-    let id = fm_popup(w, W12FC_SORT, &SORT_LABEL, cur, 100);
-    if !(100..104).contains(&id) {
-        return;
-    }
-    let applied = match fm_active(w) {
-        Some(t) => {
-            t.sort = w12_fm_sort_next(t.sort, id - 100);
-            true
+    use windows::Win32::UI::WindowsAndMessaging::{MF_POPUP, MF_SEPARATOR};
+    let Some(t) = fm_active(w) else { return };
+    let sort = t.sort;
+    let fv = fm_folder_view(t);
+    // Kelompok aktif: indeks kolom SORT_LABEL, -1 = tidak dikelompokkan (PKEY_Null) atau kolom lain.
+    let mut group = -1i32;
+    if let Some(fv) = fv.as_ref() {
+        let mut key = PROPERTYKEY::default();
+        let mut asc = windows::core::BOOL(1);
+        if unsafe { fv.GetGroupBy(&mut key, Some(&mut asc)) }.is_ok() {
+            group = (0..SORT_LABEL.len() as i32).find(|&c| fm_sort_key(c) == key).unwrap_or(-1);
         }
-        None => false,
+    }
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
+    let Ok(gm) = (unsafe { CreatePopupMenu() }) else {
+        let _ = unsafe { DestroyMenu(menu) };
+        return;
     };
-    if applied {
-        fm_apply_sort(w);
+    let add = |m: HMENU, id: usize, label: &str, on: bool| {
+        let t = to_wide_z(label);
+        let f = if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = unsafe { AppendMenuW(m, f, id, pcw(&t)) };
+    };
+    for (i, label) in SORT_LABEL.iter().enumerate() {
+        add(menu, 100 + i, label, i as i32 == sort.col);
+        add(gm, 120 + i, label, i as i32 == group);
+    }
+    let _ = unsafe { AppendMenuW(gm, MF_SEPARATOR, 0, PCWSTR::null()) };
+    add(gm, 124, "(Tidak ada)", group < 0);
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    add(menu, 110, "Naik", sort.col >= 0 && !sort.desc);
+    add(menu, 111, "Turun", sort.col >= 0 && sort.desc);
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    let gt = to_wide_z("Kelompokkan menurut");
+    let _ = unsafe { AppendMenuW(menu, MF_POPUP, gm.0 as usize, pcw(&gt)) };
+    let r = chrome::cmd_rect(w, W12FC_SORT as usize);
+    let mut pt = POINT { x: r.left, y: r.bottom };
+    let _ = unsafe { ClientToScreen(w.h, &mut pt) };
+    let id = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, None, w.h, None) }.0;
+    // DestroyMenu menu induk ikut menghancurkan submenu kelompok.
+    let _ = unsafe { DestroyMenu(menu) };
+    match id {
+        100..=103 => {
+            if let Some(t) = fm_active(w) {
+                // Pilih kolom dari menu: arah tetap (Explorer); kolom baru mulai Naik.
+                let col = id - 100;
+                t.sort = if col == t.sort.col { t.sort } else { w12_fm_sort_next(t.sort, col) };
+            }
+            fm_apply_sort(w);
+        }
+        110 | 111 => {
+            if let Some(t) = fm_active(w) {
+                if t.sort.col < 0 {
+                    t.sort.col = 0;
+                }
+                t.sort.desc = id == 111;
+            }
+            fm_apply_sort(w);
+        }
+        120..=124 => {
+            if let Some(fv) = fv {
+                let key = if id == 124 { PROPERTYKEY::default() } else { fm_sort_key(id - 120) };
+                if unsafe { fv.SetGroupBy(&key, true) }.is_err() {
+                    fm_status(w, "Pengelompokan tidak didukung di folder ini", true);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
 /// Menu mode tampilan (FmBarCommand VIEW).
+/// Sejak 2026-11-19 sama dengan menu Tampilan Explorer Windows 11: 8 mode, Tampilan ringkas, submenu Tampilkan.
 fn fm_view_menu(w: &mut FmWin) {
-    let id = fm_popup(w, W12FC_VIEW, &VIEW_LABEL, -1, 200);
-    if (200..205).contains(&id) {
-        fm_apply_view(w, id - 200);
+    use crate::files::extras::{adv_on, pane_on, ADV_CHECK, ADV_COMPACT, ADV_EXT, ADV_HIDDEN};
+    use windows::Win32::UI::Shell::{FVM_CONTENT, FVM_SMALLICON};
+    use windows::Win32::UI::WindowsAndMessaging::{MF_POPUP, MF_SEPARATOR};
+    const MODES: [(&str, FOLDERVIEWMODE, i32); 8] = [
+        ("Ikon sangat besar", FVM_ICON, 256),
+        ("Ikon besar", FVM_ICON, 96),
+        ("Ikon sedang", FVM_ICON, 48),
+        ("Ikon kecil", FVM_SMALLICON, 16),
+        ("Daftar", FVM_LIST, 16),
+        ("Detail", FVM_DETAILS, 16),
+        ("Ubin", FVM_TILE, 48),
+        ("Konten", FVM_CONTENT, 32),
+    ];
+    let dpi = dpi_of(w.h);
+    let fv = fm_active(w).and_then(|t| fm_folder_view(t));
+    let (cur_mode, cur_size) = match fv.as_ref() {
+        Some(fv) => {
+            let mut m = FOLDERVIEWMODE(0);
+            let mut sz = 0i32;
+            let _ = unsafe { fv.GetViewModeAndIconSize(&mut m, &mut sz) };
+            (m, sz)
+        }
+        None => (FOLDERVIEWMODE(0), 0),
+    };
+    // Mode aktif: mode sama, untuk FVM_ICON ukuran terdekat.
+    let mut checked = -1i32;
+    for (i, (_, m, sz)) in MODES.iter().enumerate() {
+        if *m == cur_mode {
+            if *m != FVM_ICON {
+                checked = i as i32;
+                break;
+            }
+            let want = if cur_size >= 192 { 256 } else if cur_size >= 72 { 96 } else { 48 };
+            if *sz == want {
+                checked = i as i32;
+                break;
+            }
+        }
+    }
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
+    let Ok(show) = (unsafe { CreatePopupMenu() }) else {
+        let _ = unsafe { DestroyMenu(menu) };
+        return;
+    };
+    let add = |m: HMENU, id: usize, label: &str, on: bool| {
+        let t = to_wide_z(label);
+        let f = if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = unsafe { AppendMenuW(m, f, id, pcw(&t)) };
+    };
+    for (i, (label, _, _)) in MODES.iter().enumerate() {
+        add(menu, 200 + i, label, i as i32 == checked);
+    }
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    add(menu, 220, "Tampilan ringkas", adv_on(ADV_COMPACT));
+    add(show, 230, "Panel detail\tAlt+Shift+P", pane_on(true));
+    add(show, 231, "Panel pratinjau\tAlt+P", pane_on(false));
+    let _ = unsafe { AppendMenuW(show, MF_SEPARATOR, 0, PCWSTR::null()) };
+    add(show, 232, "Kotak centang item", adv_on(ADV_CHECK));
+    add(show, 233, "Ekstensi nama file", adv_on(ADV_EXT));
+    add(show, 234, "Item tersembunyi", adv_on(ADV_HIDDEN));
+    let st = to_wide_z("Tampilkan");
+    let _ = unsafe { AppendMenuW(menu, MF_POPUP, show.0 as usize, pcw(&st)) };
+    let r = chrome::cmd_rect(w, W12FC_VIEW as usize);
+    let mut pt = POINT { x: r.left, y: r.bottom };
+    let _ = unsafe { ClientToScreen(w.h, &mut pt) };
+    let id = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, None, w.h, None) }.0;
+    // DestroyMenu menu induk ikut menghancurkan submenu "Tampilkan".
+    let _ = unsafe { DestroyMenu(menu) };
+    match id {
+        200..=207 => {
+            let (_, m, sz) = MODES[(id - 200) as usize];
+            if let Some(fv) = fv {
+                // Dibatasi 256: dulu dikali DPI tanpa batas (384 px di 150%), melebihi ukuran maksimum ikon/gambar
+                // mini sehingga gambar tampak melar (2026-11-19).
+                let size = if m == FVM_ICON { px(sz, dpi).min(256) } else { 0 };
+                let _ = unsafe { fv.SetViewModeAndIconSize(m, size) };
+            }
+            fm_refresh_selection(w);
+            crate::files::viewstate::fill_soon(w.h);
+        }
+        220 => crate::files::extras::toggle_adv(w, ADV_COMPACT),
+        230 => crate::files::extras::pane_toggle(w, true),
+        231 => crate::files::extras::pane_toggle(w, false),
+        232 => crate::files::extras::toggle_adv(w, ADV_CHECK),
+        233 => crate::files::extras::toggle_adv(w, ADV_EXT),
+        234 => crate::files::extras::toggle_adv(w, ADV_HIDDEN),
+        _ => {}
     }
 }
 
@@ -1230,8 +1121,8 @@ fn fm_apply_view(w: &mut FmWin, mode: i32) {
     };
     let (vm, size) = match mode {
         1 => (FVM_LIST, 0),
-        2 => (FVM_ICON, px(48, dpi)),
-        3 => (FVM_ICON, px(96, dpi)),
+        2 => (FVM_ICON, px(48, dpi).min(256)),
+        3 => (FVM_ICON, px(96, dpi).min(256)),
         4 => (FVM_TILE, 0),
         _ => (FVM_DETAILS, 0),
     };

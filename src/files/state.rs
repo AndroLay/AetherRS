@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, MAX_PATH};
-use windows::Win32::Graphics::Gdi::HBRUSH;
+use windows::Win32::Graphics::Gdi::{HBRUSH, HFONT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::IExplorerBrowser;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
@@ -29,9 +29,11 @@ pub const HOME_ADDRESS: &str = "shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}";
 pub const COPY_TAG: usize = 0x5731_4631;
 
 pub const FM_MAX_WINDOWS: usize = 16;
-pub const FM_TABH_DIP: i32 = 36;
-pub const FM_NAVH_DIP: i32 = 40;
-pub const FM_CMDH_DIP: i32 = 40;
+pub const FM_TABH_DIP: i32 = 40;
+pub const FM_NAVH_DIP: i32 = 48;
+pub const FM_CMDH_DIP: i32 = 48;
+/// Tinggi bilah status bawah (chrome.rs).
+pub const FM_STATH_DIP: i32 = 26;
 pub const FM_HISTMAX: usize = 50;
 
 // Alias PIDL. Tidak ada di crate windows 0.61.3 (shtypes.h). Tipe dasarnya ITEMIDLIST.
@@ -60,6 +62,15 @@ pub struct FmTab {
     pub sort: W12FmSort,
     /// Isi tab sekarang hasil pencarian (cur tetap folder asal).
     pub searching: bool,
+    /// Indeks ikon kecil di image list sistem (-1 bila belum ada).
+    pub icon: i32,
+    /// Keadaan tampilan folder saat dibuka (viewstate.rs); disimpan saat pergi hanya bila berubah.
+    pub vs_init: String,
+    /// Keadaan tersimpan untuk folder tujuan, diterapkan di OnViewCreated.
+    pub vs_pending: Option<String>,
+    /// Kolom Nama yang dilebarkan agar kolom Detail mengisi lebar tampilan: lebar terakhir yang dipasang dan tambahannya.
+    pub fill_w: i32,
+    pub fill_extra: i32,
 }
 
 // ---- win12files.cpp:52-54 ----
@@ -70,6 +81,14 @@ pub const FM_HIT_TABCLOSE: i32 = 2;
 pub const FM_HIT_PLUS: i32 = 3;
 pub const FM_HIT_NAV: i32 = 4;
 pub const FM_HIT_CMD: i32 = 5;
+/// Segmen breadcrumb, kotak alamat kosong (masuk mode ketik), tombol tampilan di bilah status.
+pub const FM_HIT_CRUMB: i32 = 6;
+pub const FM_HIT_ADDR: i32 = 7;
+pub const FM_HIT_VIEWBTN: i32 = 8;
+pub const FM_HIT_SPLIT: i32 = 9;
+pub const FM_HIT_TERMBTN: i32 = 10;
+pub const FM_HIT_CHEV: i32 = 11;
+pub const FM_TERMH_DIP: i32 = 220;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct FmHit {
@@ -107,6 +126,27 @@ pub struct FmWin {
     pub has_sel: bool,
     /// Nomor pencarian terakhir. Hasil dengan nomor lain dibuang.
     pub search_gen: u32,
+    /// Font UI kotak edit (Segoe UI 9 pt), dihapus saat jendela hancur.
+    pub font: HFONT,
+    /// Image list ikon kecil sistem (milik sistem, tidak dihancurkan).
+    pub himl: isize,
+    /// Kotak alamat sedang dalam mode ketik (EDIT tampil, breadcrumb disembunyikan).
+    pub editing: bool,
+    /// Segmen breadcrumb folder aktif (akar ke folder) dan kotaknya saat digambar.
+    pub crumbs: Vec<Vec<u16>>,
+    pub crumb_rects: Vec<(i32, windows::Win32::Foundation::RECT)>,
+    /// Jumlah item, item terpilih, dan mode Detail untuk bilah status.
+    pub n_items: i32,
+    pub n_sel: i32,
+    pub details: bool,
+    /// Panel terminal F4 (null bila belum dibuka), tampil atau tidak, tinggi dalam DIP.
+    pub term: HWND,
+    pub term_on: bool,
+    pub term_h: i32,
+    /// Sedang menyeret pembatas panel terminal.
+    pub split_drag: bool,
+    /// Chevron breadcrumb (indeks segmen, kotak) untuk dropdown subfolder.
+    pub chev_rects: Vec<(i32, windows::Win32::Foundation::RECT)>,
 }
 
 // ---- win12files.cpp:74 (g_wins) ----
