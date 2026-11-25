@@ -550,11 +550,18 @@ pub(crate) unsafe fn center_stuck_system_dialog(h: HWND) {
     let work = mi.rcWork;
     let ww = work.right - work.left;
     let wh = work.bottom - work.top;
-    // Skip fullscreen/near-maximized windows and windows not stuck near the top-left corner.
+    // Skip fullscreen/near-maximized windows and windows already positioned inside the work area
+    // away from the top-left corner. Note: OpenWith.exe on Windows 11 often centers on (0,0) when
+    // Explorer is absent, placing rc.left/rc.top deeply negative (only a corner peeks on-screen).
     if w >= ww - 40 || ht >= wh - 40 {
         return;
     }
-    if rc.left < work.left - 24 || rc.left > work.left + 80 || rc.top < work.top - 24 || rc.top > work.top + 80 {
+    let offscreen_or_corner = rc.left < work.left
+        || rc.top < work.top
+        || rc.right > work.right
+        || rc.bottom > work.bottom
+        || (rc.left <= work.left + 80 && rc.top <= work.top + 80);
+    if !offscreen_or_corner {
         return;
     }
     let Some(exe) = window_exe_basename(h) else {
