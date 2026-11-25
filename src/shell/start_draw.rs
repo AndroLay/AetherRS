@@ -53,7 +53,7 @@ pub fn start_reset() {
     ST_POWER.set(0);
     ST_SEL.set(0);
     ST_ALL_APPS_MODE.set(false);
-    ST_ALL_SCROLL.set(0);
+    all_scroll_reset();
     ST_ALL_SELECTED.set(-1);
     // Ikon hasil cari hanya dipakai selama mencari: lepas agar RAM tetap kecil.
     for e in ST_IDX.borrow_mut().iter_mut() {
@@ -217,7 +217,7 @@ pub fn start_key(vk: i32) -> bool {
                 return false; // halaman Beranda: Esc menutup panel
             }
             ST_ALL_APPS_MODE.set(false);
-            ST_ALL_SCROLL.set(0);
+            all_scroll_reset();
             ST_ALL_SELECTED.set(-1);
             return true;
         }
@@ -233,7 +233,7 @@ pub fn start_key(vk: i32) -> bool {
             return true;
         }
         if is(VK_UP) || is(VK_DOWN) || is(VK_HOME) || is(VK_END) || is(VK_PRIOR) || is(VK_NEXT) {
-            let n_all = ST_ALL_N_APPS.get();
+            let n_all = st_all_len();
             if n_all == 0 {
                 return false;
             }
@@ -267,14 +267,13 @@ pub fn start_key(vk: i32) -> bool {
             }
             ST_ALL_SELECTED.set(sel);
             let row_top = sel * step;
-            let mut scroll = ST_ALL_SCROLL.get();
+            let mut scroll = ST_ALL_TGT.get();
             if row_top < scroll {
                 scroll = row_top;
             } else if row_top + step > scroll + view {
                 scroll = row_top + step - view;
             }
-            ST_ALL_SCROLL.set(scroll);
-            st_all_apps_clamp_scroll();
+            all_scroll_to(scroll);
             return true;
         }
     }
@@ -296,7 +295,72 @@ pub fn start_key(vk: i32) -> bool {
     false
 }
 
+// ---------------------------------------------------------------- scroll halus "Semua aplikasi" (2026-11-15)
+// ST_ALL_SCROLL = posisi tampil (dipakai gambar dan hit-test); ST_ALL_TGT = tujuan. Timer T_ALLSCROLL (16 ms)
+// mendekatkan posisi ke tujuan dengan easing eksponensial, dan sekaligus menjalankan animasi masuk daftar.
+static ST_ALL_TGT: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
+static ST_ALL_ENTER: SyncCell<Cell<Option<std::time::Instant>>> = SyncCell::new(Cell::new(None));
+/// Lama total animasi masuk: 14 baris × 14 ms jeda + 180 ms per baris.
+const ALL_ENTER_MS: f32 = 380.0;
+
+/// Kemajuan animasi masuk 0..1 (1 = selesai).
+fn all_enter_k() -> f32 {
+    match ST_ALL_ENTER.get() {
+        Some(t0) => (t0.elapsed().as_secs_f32() * 1000.0 / ALL_ENTER_MS).min(1.0),
+        None => 1.0,
+    }
+}
+
+/// Gulir halus ke posisi `t` (dijepit ke rentang sah).
+pub fn all_scroll_to(t: i32) {
+    let t = t.clamp(0, st_all_apps_max_scroll());
+    ST_ALL_TGT.set(t);
+    if t != ST_ALL_SCROLL.get() {
+        set_timer(T_ALLSCROLL, 16);
+    }
+}
+
+/// Kembali ke atas seketika (tanpa animasi); posisi dan tujuan disamakan.
+pub fn all_scroll_reset() {
+    ST_ALL_SCROLL.set(0);
+    ST_ALL_TGT.set(0);
+}
+
+/// Mulai animasi masuk daftar (dipanggil saat beralih ke "Semua aplikasi").
+fn all_enter_start() {
+    all_scroll_reset();
+    ST_ALL_ENTER.set(Some(std::time::Instant::now()));
+    set_timer(T_ALLSCROLL, 16);
+}
+
+/// Timer T_ALLSCROLL.
+pub fn all_apps_tick() {
+    let open = PANEL_OPEN.get() == PN_START && ST_ALL_APPS_MODE.get() && !PAN.get().0.is_null();
+    if !open {
+        kill_timer(T_ALLSCROLL);
+        ST_ALL_ENTER.set(None);
+        return;
+    }
+    let cur = ST_ALL_SCROLL.get();
+    let tgt = ST_ALL_TGT.get().clamp(0, st_all_apps_max_scroll());
+    let diff = tgt - cur;
+    let next = if diff.abs() <= 1 {
+        tgt
+    } else {
+        let stepv = ((diff as f32) * 0.28).round() as i32;
+        cur + if stepv == 0 { diff.signum() } else { stepv }
+    };
+    ST_ALL_SCROLL.set(next);
+    let entering = all_enter_k() < 1.0;
+    if next == tgt && !entering {
+        kill_timer(T_ALLSCROLL);
+        ST_ALL_ENTER.set(None);
+    }
+    let _ = w12_invalidate(PAN.get(), None, false);
+}
+
 /// Port `StartWheel` (w12start.inc:922). Menggulir daftar Semua aplikasi.
+/// 2026-11-15: halus (beranimasi), 2 baris per takik roda; touchpad (delta kecil) tetap proporsional.
 pub fn start_wheel(delta: i32) {
     if !ST_ALL_APPS_MODE.get() || ST_Q_LEN.get() != 0 {
         return;
@@ -304,10 +368,11 @@ pub fn start_wheel(delta: i32) {
     st_all_apps_ensure();
     let row = ST_ALL_ROW_STEP.get();
     let step = if row > 0 { row } else { s(40.0) };
-    let moved = unsafe { MulDiv(delta, step, WHEEL_DELTA as i32) };
-    ST_ALL_SCROLL.set(ST_ALL_SCROLL.get() - moved);
+    let moved = unsafe { MulDiv(delta, step * 2, WHEEL_DELTA as i32) };
+    // dasar = tujuan yang sedang dituju, agar beberapa takik cepat terakumulasi
+    let base = if ST_ALL_TGT.get() != ST_ALL_SCROLL.get() { ST_ALL_TGT.get() } else { ST_ALL_SCROLL.get() };
     ST_ALL_SELECTED.set(-1);
-    st_all_apps_clamp_scroll();
+    all_scroll_to(base - moved);
 }
 
 /// Port `StartActivate` (w12start.inc:931). Dipanggil panel saat item PN_START diklik.
@@ -330,13 +395,13 @@ pub fn start_activate(id: i32) {
     if id == PAN_ID_START_ALL_VIEW {
         ST_ALL_APPS_MODE.set(true);
         st_all_apps_ensure();
-        ST_ALL_SCROLL.set(0);
-        ST_ALL_SELECTED.set(if ST_ALL_N_APPS.get() != 0 { 0 } else { -1 });
+        all_enter_start();
+        ST_ALL_SELECTED.set(if st_all_len() != 0 { 0 } else { -1 });
         return;
     }
     if id == PAN_ID_START_HOME {
         ST_ALL_APPS_MODE.set(false);
-        ST_ALL_SCROLL.set(0);
+        all_scroll_reset();
         ST_ALL_SELECTED.set(-1);
         return;
     }
@@ -344,7 +409,7 @@ pub fn start_activate(id: i32) {
         start_all_apps_jump_to_letter(id - PAN_ID_START_ALPHA);
         return;
     }
-    if id >= PAN_ID_START_ALL_APP && id - PAN_ID_START_ALL_APP < ST_ALL_N_APPS.get() {
+    if id >= PAN_ID_START_ALL_APP && id - PAN_ID_START_ALL_APP < st_all_len() {
         st_all_app_open(id - PAN_ID_START_ALL_APP);
         return;
     }
@@ -433,6 +498,11 @@ fn start_pin_cell(ai: i32, x0: f32, y0: f32, x1: f32, y1: f32) {
     let app = &mut apps[ai as usize];
     draw_icon_at(&mut app.icon, (x0 + x1) * 0.5 - sf(16.0), t, sf(32.0), 1.0);
     text(&app.name, TF_XSC.borrow().as_ref(), x0 + sf(2.0), t + sf(40.0), x1 - sf(2.0), t + sf(58.0), p.text, 1.0);
+    // titik "berjalan" ala dok macOS di bawah ikon
+    if !app.wins.is_empty() {
+        let cx = (x0 + x1) * 0.5;
+        fill_rr(cx - sf(2.0), t + sf(34.0), cx + sf(2.0), t + sf(38.0), sf(2.0), p.accent, 1.0);
+    }
 }
 
 /// Port `StartRow` (w12start.inc:1011): baris aplikasi dengan ikon, nama, dan keterangan.
@@ -494,26 +564,36 @@ fn nl_phone_info() -> PhoneInfo {
 
 /// Port `StartPhoneCard` (w12start.inc:1024): kartu Ponsel dari API lokal NectarLink.
 fn start_phone_card(l: f32, t: f32, r: f32, b: f32) {
+    // 2026-11-15: kartu dirombak (pita aksen, ilustrasi ponsel, pil status, bilah baterai, ubin info).
     let p = PALETTE.borrow();
     let inn = sf(18.0);
     fill_rr(l, t, r, b, sf(18.0), p.chip, 1.0);
-    let ix = l + sf(18.0);
-    let tx = l + sf(56.0);
-    {
-        let mut ic = ST_NL_ICON.borrow_mut();
-        if ic.src.is_some() {
-            draw_icon_at(&mut ic, ix, t + sf(18.0), sf(28.0), 1.0);
-        } else {
-            glyph(0xE8EA, TF_GLYPH_MD.borrow().as_ref(), ix + sf(14.0), t + sf(32.0), sf(12.0), p.glyph, 1.0);
-        }
-    }
-    text("Ponsel", TF_T2.borrow().as_ref(), tx, t + sf(14.0), r - inn, t + sf(34.0), p.text, 1.0);
     let nd = nl_phone_info();
     let nl = ST_NL.get();
     let has_phone = NL_API_STATE.get() == NL_API_READY && nd.has_android;
     let phone_online = has_phone && nd.online;
+    // pita atas
+    fill_rr(l, t, r, t + sf(150.0), sf(18.0), p.accent_soft, 1.0);
+    {
+        let mut ic = ST_NL_ICON.borrow_mut();
+        if ic.src.is_some() {
+            draw_icon_at(&mut ic, l + sf(14.0), t + sf(14.0), sf(20.0), 1.0);
+        }
+    }
+    text("NectarLink", TF_B.borrow().as_ref(), l + sf(42.0), t + sf(12.0), r - inn, t + sf(36.0), p.text, 1.0);
+    // ilustrasi ponsel di tengah pita
+    let cx = (l + r) * 0.5;
+    let (pt0, pb0) = (t + sf(40.0), t + sf(134.0));
+    fill_rr(cx - sf(29.0), pt0 - sf(3.0), cx + sf(29.0), pb0 + sf(3.0), sf(14.0), p.accent, if phone_online { 0.9 } else { 0.35 });
+    fill_rr(cx - sf(26.0), pt0, cx + sf(26.0), pb0, sf(12.0), p.panel, 1.0);
+    fill_rr(cx - sf(8.0), pt0 + sf(6.0), cx + sf(8.0), pt0 + sf(10.0), sf(2.0), p.sub2, 1.0);
+    let face = if phone_online { 0xE8EA } else if nl == 0 { 0xE896 } else { 0xEA6A };
+    glyph(face, TF_GLYPH_MD.borrow().as_ref(), cx, (pt0 + pb0) * 0.5 + sf(2.0), sf(12.0), if phone_online { p.accent } else { p.sub }, 1.0);
+    // pil status
     let st_text = if phone_online {
         "Ponsel terhubung"
+    } else if has_phone {
+        "Ponsel offline"
     } else if nl == 2 {
         "NectarLink berjalan"
     } else if nl == 1 {
@@ -521,32 +601,57 @@ fn start_phone_card(l: f32, t: f32, r: f32, b: f32) {
     } else {
         "NectarLink belum terpasang"
     };
+    let sy0 = t + sf(160.0);
+    fill_rr(l + inn, sy0, r - inn, sy0 + sf(26.0), sf(13.0), p.chip_hover, 1.0);
     let dot = if phone_online { p.accent } else { p.sub2 };
-    fill_rr(tx, t + sf(42.0), tx + sf(6.0), t + sf(48.0), sf(3.0), dot, 1.0);
-    text(st_text, TF_SUB.borrow().as_ref(), tx + sf(12.0), t + sf(36.0), r - inn, t + sf(54.0), p.sub, 1.0);
-    fill_rr(l + inn, t + sf(70.0), r - inn, t + sf(70.0) + 1.0, 0.0, p.sep, 1.0);
+    fill_rr(l + inn + sf(12.0), sy0 + sf(10.0), l + inn + sf(18.0), sy0 + sf(16.0), sf(3.0), dot, 1.0);
+    text(st_text, TF_SUB.borrow().as_ref(), l + inn + sf(26.0), sy0, r - inn - sf(8.0), sy0 + sf(26.0), p.text, 1.0);
     if has_phone {
         let phone_name = nd.name.clone().unwrap_or_else(|| "Ponsel Android".to_string());
-        text(&phone_name, TF_SSC.borrow().as_ref(), l + inn, t + sf(82.0), r - inn, t + sf(103.0), p.text, 1.0);
+        text(&phone_name, TF_T2.borrow().as_ref(), l + inn, t + sf(196.0), r - inn, t + sf(220.0), p.text, 1.0);
         let route = if !nd.online {
             "Tidak tersambung"
         } else if nd.link == "relay" {
-            "Online · Relay internet"
+            "Relay internet"
         } else if nd.link == "lan" {
-            "Online · Wi-Fi lokal"
+            "Wi-Fi lokal"
         } else if nd.link == "tailscale" {
-            "Online · Tailscale"
+            "Tailscale"
         } else {
-            "Online · Terhubung"
+            "Terhubung"
         };
-        text(route, TF_SC.borrow().as_ref(), l + inn, t + sf(104.0), r - inn, t + sf(124.0), p.sub, 1.0);
-        let battery = if nd.has_battery {
-            let suffix = if nd.charging { " · Mengisi daya" } else { "" };
-            format!("Baterai {}%{}", nd.battery, suffix)
+        // baterai: label, persen, bilah
+        let by = t + sf(230.0);
+        let (btxt, frac) = if nd.has_battery {
+            (format!("{}%{}", nd.battery, if nd.charging { " \u{00B7} mengisi" } else { "" }), (nd.battery.clamp(0, 100) as f32) / 100.0)
         } else {
-            "Baterai tidak tersedia".to_string()
+            ("Tidak tersedia".to_string(), 0.0)
         };
-        text(&battery, TF_SC.borrow().as_ref(), l + inn, t + sf(126.0), r - inn, t + sf(146.0), p.sub, 1.0);
+        // satu baris rata kiri (format *C rata tengah membuat label dan nilai saling menimpa)
+        let bat_line = format!("Baterai  {}", btxt);
+        text(&bat_line, TF_SUB.borrow().as_ref(), l + inn, by, r - inn, by + sf(20.0), p.text, 1.0);
+        let bar_t = by + sf(24.0);
+        fill_rr(l + inn, bar_t, r - inn, bar_t + sf(8.0), sf(4.0), p.track, 1.0);
+        if frac > 0.0 {
+            let low = nd.battery <= 20 && !nd.charging;
+            let col = if low { rgba(232, 72, 72, 1.0) } else { p.accent };
+            let bw = ((r - inn) - (l + inn)) * frac;
+            fill_rr(l + inn, bar_t, l + inn + bw.max(sf(8.0)), bar_t + sf(8.0), sf(4.0), col, 1.0);
+        }
+        // dua ubin info
+        let ty0 = bar_t + sf(20.0);
+        let ty1 = ty0 + sf(54.0);
+        let mid = (l + r) * 0.5;
+        for (k, (lab, val, g)) in [("Jalur", route, 0xE701u16), ("Status", if nd.online { "Online" } else { "Offline" }, 0xE8EA)]
+            .iter()
+            .enumerate()
+        {
+            let (x0, x1) = if k == 0 { (l + inn, mid - sf(4.0)) } else { (mid + sf(4.0), r - inn) };
+            fill_rr(x0, ty0, x1, ty1, sf(12.0), p.chip_hover, 1.0);
+            glyph(*g, TF_GLYPH.borrow().as_ref(), x0 + sf(16.0), ty0 + sf(16.0), sf(8.0), p.accent, 1.0);
+            text(lab, TF_XS.borrow().as_ref(), x0 + sf(30.0), ty0 + sf(6.0), x1 - sf(6.0), ty0 + sf(26.0), p.sub, 1.0);
+            text(val, TF_S.borrow().as_ref(), x0 + sf(10.0), ty0 + sf(28.0), x1 - sf(6.0), ty1 - sf(6.0), p.text, 1.0);
+        }
     } else {
         let message = if nl == 0 {
             "NectarLink belum terpasang di PC ini."
@@ -560,13 +665,29 @@ fn start_phone_card(l: f32, t: f32, r: f32, b: f32) {
                 _ => "API lokal NectarLink tidak merespons. Pastikan aplikasinya berjalan.",
             }
         };
-        st_text_wrap(message, &TF_S, l + inn, t + sf(84.0), r - inn, t + sf(150.0), p.sub);
+        st_text_wrap(message, &TF_S, l + inn, t + sf(198.0), r - inn, t + sf(262.0), p.sub);
     }
     let b2b = b - sf(16.0);
     let b2t = b2b - sf(36.0);
     let b1b = b2t - sf(6.0);
     let b1t = b1b - sf(40.0);
-    glyph(0xE8EA, TF_GLYPH_LG.borrow().as_ref(), (l + r) * 0.5, (t + sf(150.0) + b1t) * 0.5, sf(24.0), p.sub2, 0.6); // keadaan kosong
+    // fitur NectarLink sebagai baris pintas (membuka NectarLink)
+    if nl != 0 {
+        let mut fy = if has_phone { t + sf(344.0) } else { t + sf(272.0) };
+        text("Dari ponsel", TF_SS.borrow().as_ref(), l + inn, fy, r - inn, fy + sf(18.0), p.sub, 1.0);
+        fy += sf(24.0);
+        let feats: [(u16, &str); 3] = [(0xEA8F, "Notifikasi ponsel"), (0xE8B7, "Kirim dan terima berkas"), (0xE77F, "Papan klip bersama")];
+        for (g, lab) in feats {
+            if fy + sf(34.0) > b1t - sf(8.0) {
+                break;
+            }
+            pan_hover(l + inn - sf(6.0), fy, r - inn + sf(6.0), fy + sf(34.0), sf(10.0), PAN_ID_START_NL);
+            fill_rr(l + inn, fy + sf(5.0), l + inn + sf(24.0), fy + sf(29.0), sf(8.0), p.accent_soft, 1.0);
+            glyph(g, TF_GLYPH.borrow().as_ref(), l + inn + sf(12.0), fy + sf(17.0), sf(9.0), p.text, 1.0);
+            text(lab, TF_S.borrow().as_ref(), l + inn + sf(34.0), fy, r - inn, fy + sf(34.0), p.text, 1.0);
+            fy += sf(38.0);
+        }
+    }
     if nl != 0 {
         fill_rr(l + inn, b1t, r - inn, b1b, sf(20.0), p.chip_hover, 1.0);
         pan_hover(l + inn, b1t, r - inn, b1b, sf(20.0), PAN_ID_START_NL);
@@ -684,6 +805,11 @@ static ST_ICON_MORE: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 
 /// Port `StHitIconDraw` (w12start.inc:1152): ikon satu hasil pencarian, atau glyph bila tidak ada ikon.
 fn st_hit_icon_draw(hh: &StHit, x: f32, y: f32, sz: f32) {
+    st_hit_icon_draw_a(hh, x, y, sz, 1.0);
+}
+
+/// Sama dengan `st_hit_icon_draw`, dengan opasitas `a` (animasi masuk Semua aplikasi).
+fn st_hit_icon_draw_a(hh: &StHit, x: f32, y: f32, sz: f32, a: f32) {
     let p = PALETTE.borrow();
     if hh.kind == ST_HIT_SETTING || hh.kind == ST_HIT_CALC || hh.kind == ST_HIT_CMD {
         let g: u16 = if hh.kind == ST_HIT_SETTING {
@@ -693,7 +819,7 @@ fn st_hit_icon_draw(hh: &StHit, x: f32, y: f32, sz: f32) {
         } else {
             0xE756
         };
-        glyph(g, TF_GLYPH_MD.borrow().as_ref(), x + sz * 0.5, y + sz * 0.5, sz * 0.56, p.glyph, 1.0);
+        glyph(g, TF_GLYPH_MD.borrow().as_ref(), x + sz * 0.5, y + sz * 0.5, sz * 0.56, p.glyph, a);
         return;
     }
     let belum_dimuat = ST_IDX
@@ -704,7 +830,7 @@ fn st_hit_icon_draw(hh: &StHit, x: f32, y: f32, sz: f32) {
         if ST_ICON_BUDGET.get() <= 0 {
             // belum dimuat: kotak bayangan, gambar berikutnya menyusul
             ST_ICON_MORE.set(true);
-            fill_rr(x, y, x + sz, y + sz, sz * 0.25, p.chip, 1.0);
+            fill_rr(x, y, x + sz, y + sz, sz * 0.25, p.chip, a);
             return;
         }
         ST_ICON_BUDGET.set(ST_ICON_BUDGET.get() - 1);
@@ -712,7 +838,7 @@ fn st_hit_icon_draw(hh: &StHit, x: f32, y: f32, sz: f32) {
     // cukup tajam untuk pratinjau 56 dip
     let ada = st_hit_icon_with(hh, s(56.0), |ic| {
         if ic.src.is_some() {
-            draw_icon_at(ic, x, y, sz, 1.0);
+            draw_icon_at(ic, x, y, sz, a);
             true
         } else {
             false
@@ -720,7 +846,7 @@ fn st_hit_icon_draw(hh: &StHit, x: f32, y: f32, sz: f32) {
     });
     if !ada {
         // ikon aplikasi umum
-        glyph(0xE71D, TF_GLYPH_MD.borrow().as_ref(), x + sz * 0.5, y + sz * 0.5, sz * 0.5, p.sub, 1.0);
+        glyph(0xE71D, TF_GLYPH_MD.borrow().as_ref(), x + sz * 0.5, y + sz * 0.5, sz * 0.5, p.sub, a);
     }
 }
 
@@ -986,7 +1112,7 @@ fn start_all_apps_draw(w: f32, h: f32, m: f32, lx1: f32, px0: f32, px1: f32, top
     ST_ALL_ROW_STEP.set(row_step.round() as i32);
     ST_ALL_VIEW_HEIGHT.set((list_bottom - list_top).round() as i32);
     st_all_apps_clamp_scroll();
-    let n_apps = ST_ALL_N_APPS.get();
+    let n_apps = st_all_len();
     if n_apps == 0 {
         let busy = ST_IDX_BUSY.load(std::sync::atomic::Ordering::SeqCst) && ST_IDX.borrow().is_empty();
         let pesan = if busy { "Memuat daftar aplikasi\u{2026}" } else { "Aplikasi belum ditemukan" };
@@ -996,19 +1122,59 @@ fn start_all_apps_draw(w: f32, h: f32, m: f32, lx1: f32, px0: f32, px1: f32, top
         let step = ST_ALL_ROW_STEP.get();
         let range = w12_start_visible_items(n_apps, scroll, step, ST_ALL_VIEW_HEIGHT.get());
         let selected = ST_ALL_SELECTED.get();
+        // 2026-11-15: pengelompokan per huruf; huruf grup tampil di kolom kiri pada baris pertama grup.
+        let group_of = |i: i32| -> char {
+            let r = ST_ALL_APPS.borrow().get(i as usize).copied();
+            let c = r.map(|r| st_first_lower(&st_all_app_name(r))).unwrap_or('\0');
+            if c.is_ascii_alphabetic() {
+                c.to_ascii_uppercase()
+            } else {
+                '#'
+            }
+        };
+        let mut prev = if range.first > 0 { group_of(range.first - 1) } else { '\0' };
+        // 2026-11-15: gulir halus memberi baris terpotong di tepi; potong ke area daftar.
+        let clip = windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
+            left: m - sf(2.0),
+            top: list_top,
+            right: list_right + sf(2.0),
+            bottom: list_bottom,
+        };
+        if let Some(rt) = RT.borrow().as_ref() {
+            unsafe {
+                rt.PushAxisAlignedClip(&clip, windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
+            };
+        }
+        let enter_ms = all_enter_k() * ALL_ENTER_MS;
         for i in range.first..range.last {
-            let y = list_top + (i * step - scroll) as f32;
-            if y + row_h <= list_top || y >= list_bottom {
+            // animasi masuk: baris muncul berurutan, naik 18 dip sambil memudar masuk
+            let j = (i - range.first).min(14) as f32;
+            let kr = ((enter_ms - j * 14.0) / 180.0).clamp(0.0, 1.0);
+            let e = 1.0 - (1.0 - kr).powi(3);
+            let a = e;
+            let y = list_top + (i * step - scroll) as f32 + (1.0 - e) * sf(18.0);
+            let g = group_of(i);
+            let starts = g != prev;
+            prev = g;
+            if y + row_h <= list_top || y >= list_bottom || a <= 0.0 {
                 continue;
             }
-            let x0 = m;
+            if starts {
+                if i > 0 && y - sf(2.0) > list_top {
+                    fill_rr(m + sf(30.0), y - sf(2.5), list_right - sf(8.0), y - sf(1.5), 0.0, p.sep, a);
+                }
+                fill_rr(m, y + sf(6.0), m + sf(24.0), y + sf(30.0), sf(8.0), p.chip, a);
+                text(&g.to_string(), TF_SSC.borrow().as_ref(), m, y + sf(6.0), m + sf(24.0), y + sf(30.0), p.accent, a);
+            }
+            let x0 = m + sf(30.0);
             let x1 = list_right;
             let id = PAN_ID_START_ALL_APP + i;
             if selected == i {
-                fill_rr(x0, y, x1, y + row_h, sf(9.0), p.chip_hover, 1.0);
-                fill_rr(x0, y + sf(9.0), x0 + sf(2.0), y + sf(27.0), sf(1.0), p.accent, 1.0);
+                fill_rr(x0, y, x1, y + row_h, sf(9.0), p.chip_hover, a);
+                fill_rr(x0, y + sf(9.0), x0 + sf(2.0), y + sf(27.0), sf(1.0), p.accent, a);
             }
-            pan_hover(x0, y, x1, y + row_h, sf(9.0), id);
+            // area klik dipotong ke daftar agar baris setengah tampil tidak menangkap klik di header/footer
+            pan_hover(x0, y.max(list_top), x1, (y + row_h).min(list_bottom), sf(9.0), id);
             let rf: StAllAppRef = match ST_ALL_APPS.borrow().get(i as usize) {
                 Some(r) => *r,
                 None => continue,
@@ -1022,24 +1188,27 @@ fn start_all_apps_draw(w: f32, h: f32, m: f32, lx1: f32, px0: f32, px1: f32, top
                     match_len: 0,
                     order: 0,
                 };
-                st_hit_icon_draw(&hit, x0 + sf(9.0), y + sf(7.0), sf(22.0));
+                st_hit_icon_draw_a(&hit, x0 + sf(9.0), y + sf(7.0), sf(22.0), a);
             } else {
                 let drawn = {
                     let mut apps = APPS.borrow_mut();
                     match apps.get_mut(rf.reference as usize) {
                         Some(app) if app.icon.src.is_some() => {
-                            draw_icon_at(&mut app.icon, x0 + sf(9.0), y + sf(7.0), sf(22.0), 1.0);
+                            draw_icon_at(&mut app.icon, x0 + sf(9.0), y + sf(7.0), sf(22.0), a);
                             true
                         }
                         _ => false,
                     }
                 };
                 if !drawn {
-                    glyph(0xE71D, TF_GLYPH_MD.borrow().as_ref(), x0 + sf(20.0), y + sf(18.0), sf(11.0), p.sub, 1.0);
+                    glyph(0xE71D, TF_GLYPH_MD.borrow().as_ref(), x0 + sf(20.0), y + sf(18.0), sf(11.0), p.sub, a);
                 }
             }
             let nama = st_all_app_name(rf);
-            text(&nama, TF_S.borrow().as_ref(), x0 + sf(42.0), y, x1 - sf(8.0), y + row_h, p.text, 1.0);
+            text(&nama, TF_S.borrow().as_ref(), x0 + sf(42.0), y, x1 - sf(8.0), y + row_h, p.text, a);
+        }
+        if let Some(rt) = RT.borrow().as_ref() {
+            unsafe { rt.PopAxisAlignedClip() };
         }
     }
 
@@ -1145,6 +1314,15 @@ pub fn start_draw(w: f32, h: f32) {
     }
 
     text("Disematkan", TF_SS.borrow().as_ref(), m, sec_y, lx1, sec_y + sf(18.0), p.sub, 1.0);
+    {
+        // jumlah sematan sebagai chip kecil di samping judul
+        let n = ST_PIN.borrow().len();
+        if n > 0 {
+            let cx0 = m + sf(82.0);
+            fill_rr(cx0, sec_y + sf(1.0), cx0 + sf(28.0), sec_y + sf(17.0), sf(8.0), p.chip, 1.0);
+            text(&n.to_string(), TF_XSC.borrow().as_ref(), cx0, sec_y + sf(1.0), cx0 + sf(28.0), sec_y + sf(17.0), p.sub, 1.0);
+        }
+    }
     let all_x0 = lx1 - sf(108.0);
     let all_y0 = sec_y - sf(4.0);
     fill_rr(all_x0, all_y0, lx1, all_y0 + sf(26.0), sf(13.0), p.chip_hover, 1.0);
@@ -1155,7 +1333,7 @@ pub fn start_draw(w: f32, h: f32) {
         text("Belum ada aplikasi yang disematkan", TF_S.borrow().as_ref(), m, list_y, lx1, list_y + sf(20.0), p.sub, 1.0);
     }
     let cell_w = (lx1 - m - 5.0 * cg) / 6.0;
-    let cell_h = (rec_lbl - sf(24.0) - list_y - 2.0 * cg) / 3.0;
+    let cell_h = (rec_lbl - sf(24.0) - list_y - 3.0 * cg) / 4.0;
     for (i, &ai) in pins.iter().enumerate() {
         let x0 = m + (i % 6) as f32 * (cell_w + cg);
         let y0 = list_y + (i / 6) as f32 * (cell_h + cg);

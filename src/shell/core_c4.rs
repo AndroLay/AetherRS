@@ -518,6 +518,10 @@ pub unsafe extern "system" fn win_event_proc(
         update_foreground(false);
         return;
     }
+    if ev == EVENT_SYSTEM_MINIMIZEEND && is_win && has_h {
+        // Dipulihkan lewat jalur apa pun: catatan maksimal dari dok tidak berlaku lagi.
+        take_dock_zoomed(h);
+    }
     if ev == EVENT_SYSTEM_MINIMIZEEND && is_win && has_h && is_new_app_window(h) {
         pills_hide_for(); // app dipulihkan dari dok
     }
@@ -983,7 +987,8 @@ pub unsafe extern "system" fn pill_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM)
                 let d = wp_hi_signed(wp);
                 let n = d.unsigned_abs() / WHEEL_DELTA;
                 for _ in 0..n.max(1) {
-                    send_keys(if d > 0 { VK_VOLUME_UP.0 } else { VK_VOLUME_DOWN.0 }, 0, 0);
+                    // Lewat shell (bukan send_keys) agar OSD volume bawaan Windows tidak muncul
+                    super::core_c4b::vol_wheel_post(d > 0);
                 }
             }
             return LRESULT(0);

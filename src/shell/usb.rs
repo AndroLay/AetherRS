@@ -244,6 +244,8 @@ fn usb_notice(text: &str, warn: bool) {
     // Buffer C 96 wchar_t: maksimal 95 karakter.
     *NT_MSG.borrow_mut() = text.chars().take(95).collect();
     NT_MSG_WARN.set(warn);
+    // glyph pengisi daya (NT_GLYPH_CHG) tidak boleh terbawa ke pesan USB
+    NT_MSG_GLYPH.set(0);
     NT_HUD_KIND.set(HUD_MSG);
     if NT_STATE.get() == NT_OPEN {
         let _ = super::core_c1::w12_invalidate(super::notch::NT_WND.get(), None, false);

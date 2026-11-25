@@ -28,13 +28,13 @@ use windows::Win32::System::Threading::{
     CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
     QueryFullProcessImageNameW, SetProcessWorkingSetSize, Sleep, WaitForSingleObject,
     INFINITE, PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::Shell::{
     SHGetFolderPathW, ShellExecuteW, CSIDL_COMMON_STARTUP, CSIDL_STARTUP, SHGFP_TYPE_CURRENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetShellWindow, GetSystemMetrics, GetWindowThreadProcessId, IsWindow,
+    FindWindowExW, FindWindowW, GetShellWindow, GetSystemMetrics, GetWindowThreadProcessId, IsWindow,
     IsWindowVisible, PostMessageW, ShowWindowAsync, SM_SHUTTINGDOWN, SW_SHOWNA, SW_SHOWNORMAL,
     WM_CLOSE, WM_USER,
 };
@@ -445,6 +445,20 @@ fn start_explorer(why: &str) {
         return;
     }
     restore_hidden_windows();
+    // Diagnosis (2026-11-15, Explorer hidup tanpa taskbar): catat keadaan jendela shell sebelum Explorer dijalankan.
+    let shell_w = unsafe { GetShellWindow() };
+    let sw = if shell_w.0.is_null() {
+        "kosong"
+    } else if explorer_is_shell() {
+        "milik explorer"
+    } else {
+        "milik proses lain"
+    };
+    log(&format!(
+        "sebelum Explorer dijalankan: taskbar {}, shell window {}",
+        if find_window(TRAY_CLASS).is_some() { "ada" } else { "tidak ada" },
+        sw
+    ));
     let ex = format!("{}\\explorer.exe", windows_dir());
     // Simpan nilai Shell asli ke ShellPending sebelum dihapus, agar bisa dipulihkan (lihat win12-startup.ps1).
     let saved = reg::get_string(WINLOGON, "Shell");
@@ -501,10 +515,24 @@ fn start_explorer(why: &str) {
     }
 }
 
+/// Deploy sedang berjalan: `HKCU\Software\Win12Shell\Updating` != 0, atau berkas `updating.flag` di folder exe
+/// yang umurnya < 5 menit. 2026-11-19: nilai registri yang ditulis deploy dari sesi agen tidak terlihat oleh
+/// win12boot (selalu terbaca 0, lihat boot.log "shell berakhir ... Updating=0"), jadi berkas dipakai juga.
+fn updating() -> bool {
+    if reg::our_dword("Updating") != 0 {
+        return true;
+    }
+    let flag = exe_dir().join("updating.flag");
+    match std::fs::metadata(&flag).and_then(|m| m.modified()) {
+        Ok(t) => t.elapsed().map(|d| d.as_secs() < 300).unwrap_or(true),
+        Err(_) => false,
+    }
+}
+
 /// Tunggu selagi deploy berjalan (`WaitWhileUpdating`, win12boot.c 288–291).
 fn wait_while_updating() {
     let mut i: u32 = 0;
-    while i < 400 && reg::our_dword("Updating") != 0 {
+    while i < 400 && updating() {
         unsafe { Sleep(300) };
         i += 1;
     }
@@ -573,6 +601,7 @@ fn switch_from_explorer() -> bool {
         unsafe { GetWindowThreadProcessId(sw, Some(&mut epid as *mut u32)) };
     }
     let ep = open_sync(epid);
+    OLD_EXPLORER_PID.store(epid, std::sync::atomic::Ordering::Relaxed);
     if let Some(tray) = find_window(TRAY_CLASS) {
         unsafe {
             let _ = PostMessageW(Some(tray), MSG_SWITCH, WPARAM(0), LPARAM(0));
@@ -613,6 +642,165 @@ fn switch_from_explorer() -> bool {
     false
 }
 
+/// PID Explorer yang memegang desktop sebelum peralihan (diisi `switch_from_explorer`).
+static OLD_EXPLORER_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Tutup semua jendela File Explorer (`CabinetWClass`) dengan WM_CLOSE. Mengembalikan jumlahnya.
+fn close_cabinet_windows() -> u32 {
+    let cls = to_wide_z("CabinetWClass");
+    let mut n = 0u32;
+    let mut after: Option<HWND> = None;
+    loop {
+        let h = unsafe { FindWindowExW(None, after, pcw(&cls), PCWSTR::null()) }.unwrap_or_default();
+        if h.0.is_null() {
+            break;
+        }
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        n += 1;
+        after = Some(h);
+        if n > 32 {
+            break;
+        }
+    }
+    n
+}
+
+/// Pembersihan setelah peralihan (2026-11-18). Explorer kadang melepas desktop tetapi prosesnya tetap hidup
+/// (ratusan MB). Setelah 20 dtk proses itu dihentikan bila bukan lagi shell. Winlogon (AutoRestartShell) lalu
+/// menyalakan Explorer baru yang tidak bisa menjadi shell (desktop dipegang Win12) dan hanya membuka jendela
+/// File Explorer; jendela itu ditutup selama 40 dtk, sehingga proses penggantinya keluar sendiri.
+fn explorer_cleanup() {
+    let pid = OLD_EXPLORER_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if pid == 0 {
+        return;
+    }
+    let access = PROCESS_ACCESS_RIGHTS(SYNCHRONIZE.0 | PROCESS_TERMINATE.0);
+    let Ok(h) = (unsafe { OpenProcess(access, false, pid) }) else {
+        return; // sudah keluar
+    };
+    let exited = unsafe { WaitForSingleObject(h, 20_000) } == WAIT_OBJECT_0;
+    if exited {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        log("pembersihan: Explorer lama keluar sendiri");
+        return;
+    }
+    if explorer_is_shell() {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        log("pembersihan: Explorer kembali memegang desktop; tidak dihentikan");
+        return;
+    }
+    let ok = unsafe { TerminateProcess(h, 1) }.is_ok();
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    log(&format!("pembersihan: Explorer lama (pid {pid}) tidak keluar dalam 20 dtk, dihentikan: {ok}"));
+    let mut closed = 0u32;
+    for _ in 0..40 {
+        unsafe { Sleep(1000) };
+        if explorer_is_shell() {
+            log("pembersihan: Explorer baru memegang desktop; berhenti menutup jendela");
+            return;
+        }
+        closed += close_cabinet_windows();
+    }
+    log(&format!("pembersihan selesai: {closed} jendela File Explorer pengganti ditutup"));
+}
+
+/// Ada jendela app UWP (bingkai `ApplicationFrameWindow` milik ApplicationFrameHost) yang terlihat dan tidak
+/// di-cloak DWM. App yang diminimalkan tetap dihitung; app yang ditutup/ditangguhkan tidak.
+fn uwp_windows_open() -> bool {
+    let cls = to_wide_z("ApplicationFrameWindow");
+    let mut after: Option<HWND> = None;
+    for _ in 0..64 {
+        let h = unsafe { FindWindowExW(None, after, pcw(&cls), PCWSTR::null()) }.unwrap_or_default();
+        if h.0.is_null() {
+            return false;
+        }
+        after = Some(h);
+        if !unsafe { IsWindowVisible(h) }.as_bool() {
+            continue;
+        }
+        let mut cloaked: u32 = 0;
+        let r = unsafe {
+            windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                h,
+                windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if r.is_ok() && cloaked != 0 {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Explorer sementara untuk app UWP (2026-11-18, permintaan pengguna). Explorer dijalankan sebagai shell,
+/// target dibuka, Win12 berjalan dalam mode biasa di atasnya. Setelah tidak ada jendela app UWP selama 20 dtk
+/// (atau app tidak pernah muncul dalam 60 dtk), Explorer diganti lagi oleh Win12 penuh.
+/// true = sudah kembali ke mode shell penuh (pemanggil menjalankan win12shell --shell).
+fn temp_explorer_session() -> bool {
+    start_explorer("sementara untuk app UWP");
+    open_after_switch();
+    let dir = exe_dir();
+    let shell_s = dir.join("win12shell.exe").to_string_lossy().into_owned();
+    // Win12 biasa di atas Explorer, setelah taskbar Explorer siap (start_explorer sudah menunggunya).
+    unsafe { Sleep(1500) };
+    if find_window(SHELL_CLASS).is_none() {
+        let cmd = format!("\"{}\"", shell_s);
+        if let Ok(h) = create_process(Some(shell_s.as_str()), &cmd, Some(dir.as_path())) {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+    log("explorer sementara: menunggu semua app UWP ditutup");
+    let start = unsafe { GetTickCount() };
+    let mut seen = false;
+    let mut idle_ms: u32 = 0;
+    loop {
+        unsafe { Sleep(2000) };
+        if unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0 {
+            return false;
+        }
+        if !explorer_is_shell() {
+            log("explorer sementara: Explorer tidak lagi memegang desktop; pemantauan berhenti");
+            return false;
+        }
+        if reg::our_dword("TempExplorerKeep") != 0 {
+            log("explorer sementara: dibatalkan (TempExplorerKeep), tetap di Windows biasa");
+            return false;
+        }
+        if uwp_windows_open() {
+            seen = true;
+            idle_ms = 0;
+        } else {
+            idle_ms += 2000;
+        }
+        let elapsed = unsafe { GetTickCount() }.wrapping_sub(start);
+        if (seen && idle_ms >= 20_000) || (!seen && elapsed >= 60_000) {
+            break;
+        }
+    }
+    log(&format!(
+        "explorer sementara: {} -> kembali ke Win12 penuh",
+        if seen { "semua app UWP ditutup" } else { "app UWP tidak muncul dalam 60 dtk" }
+    ));
+    if !switch_from_explorer() {
+        return false;
+    }
+    let _ = std::thread::Builder::new().name("w12-expclean".into()).spawn(explorer_cleanup);
+    true
+}
+
 /// Titik masuk (`wWinMain`, win12boot.c 348–415): peluncur login untuk mode shell penuh.
 fn main() {
     let name = to_wide_z(MUTEX_NAME);
@@ -645,8 +833,16 @@ fn main() {
         .collect();
     let cmd = args.join(" ");
     let sw = cmd.contains("--switch");
+    // --login (Run HKCU saat sign-in): beri Explorer waktu menjalankan aplikasi Startup sebelum diganti Win12.
+    if sw && cmd.contains("--login") && explorer_is_shell() {
+        log("sign-in: menunggu 20 dtk sebelum beralih ke Win12 penuh");
+        unsafe { Sleep(20_000) };
+    }
     if sw && explorer_is_shell() && !switch_from_explorer() {
         return;
+    }
+    if sw && OLD_EXPLORER_PID.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        let _ = std::thread::Builder::new().name("w12-expclean".into()).spawn(explorer_cleanup);
     }
     if explorer_is_shell() {
         log("Explorer sudah menjadi shell; win12boot berhenti");
@@ -682,6 +878,7 @@ fn main() {
             start_explorer("shell gagal dijalankan");
             break;
         };
+        let shell_started = unsafe { GetTickCount() };
         if !startup_done {
             startup_done = true;
             let mut i: u32 = 0;
@@ -694,6 +891,9 @@ fn main() {
             let _ = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
         }
         let _ = unsafe { WaitForSingleObject(p, INFINITE) };
+        // Dibaca SEGERA: deploy memasang file dalam < 1 dtk lalu menghapus penanda; dulu dibaca setelah Sleep(500)
+        // dan sering sudah 0, sehingga deploy terbaca "ditutup pengguna" dan Explorer dijalankan (2026-11-19).
+        let upd_at_exit = updating();
         let mut code: u32 = 0;
         let _ = unsafe { GetExitCodeProcess(p, &mut code) };
         let _ = unsafe { CloseHandle(p) };
@@ -702,19 +902,42 @@ fn main() {
         if shutting_down != 0 {
             break;
         }
+        let alive_ms = unsafe { GetTickCount() }.wrapping_sub(shell_started);
+        log(&format!(
+            "shell berakhir: kode=0x{:08X}, hidup {} dtk, Updating={}, deploy={}",
+            code,
+            alive_ms / 1000,
+            reg::our_dword("Updating"),
+            upd_at_exit || updating()
+        ));
         if code == 0 {
-            if reg::our_dword("Updating") != 0 {
+            if upd_at_exit || updating() {
                 log("deploy: menunggu shell baru");
                 continue;
             }
             if find_window(SHELL_CLASS).is_some() {
                 continue;
             }
-            start_explorer("Win12 Shell ditutup pengguna");
-            open_after_switch();
-            break;
+            if reg::our_dword("TempExplorer") != 0 {
+                del_value(OUR_KEY, "TempExplorer");
+                if temp_explorer_session() {
+                    restarts = 0;
+                    window_start = unsafe { GetTickCount() };
+                    continue; // kembali ke mode shell penuh: loop menjalankan win12shell --shell
+                }
+                break; // tetap di Explorer (peralihan balik gagal atau sesi berakhir)
+            }
+            // 2026-11-18: deploy di mode shell pernah berakhir dengan Explorer cadangan karena shell baru keluar
+            // dengan kode 0 beberapa detik setelah dijalankan. Keluar secepat itu bukan penutupan oleh pengguna:
+            // diperlakukan seperti crash (dijalankan ulang, maks 3 kali per 2 menit).
+            if alive_ms >= 20_000 {
+                start_explorer("Win12 Shell ditutup pengguna");
+                open_after_switch();
+                break;
+            }
+            log(&format!("shell keluar kode 0 setelah {alive_ms} ms (terlalu cepat); dianggap gagal start"));
         }
-        log(&format!("shell keluar kode=0x{:08X}", code));
+        log(&format!("shell keluar kode=0x{:08X} setelah {} ms", code, alive_ms));
         let now = unsafe { GetTickCount() };
         if now.wrapping_sub(window_start) > 120_000 {
             restarts = 0;

@@ -5,28 +5,19 @@ use super::prelude::*;
 
 use std::cell::{Cell, RefCell};
 
-use windows::core::{IInspectable, Interface, IUnknown};
-use windows::Foundation::TypedEventHandler;
-use windows::Media::Control::{
-    CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSessionManager,
-    GlobalSystemMediaTransportControlsSessionMediaProperties,
-};
+use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
 use crate::log::log;
 use crate::sync::SyncCell;
 
-use super::core_c1::{
-    async_results, async_status, decode_art, h_str, icon_free, kill_timer, media_event, media_hook,
-    thumb_begin,
-    media_unhook, s, set_timer, sf, wstr_eq, MEDIA,
-};
+use super::core_c1::{decode_art_bytes, icon_free, kill_timer, s, set_timer, sf, wstr_eq, MEDIA};
+use super::media_worker;
+use super::notch::notch_invalidate;
 use super::state::{
-    ART_PX, BAR_H, BAR_H_SMALL, G_COUNT, MAXITEMS, MAXPILLS, MEDIA_EV, MEDIA_FAILED,
-    MEDIA_TICKS, MEDIA_WANT, MGR, MGR_HOOKED, MODE, MODE_DOCK, MSG, NITEMS, OP_MGR, OP_PROPS,
-    OP_THUMB, P_CAL, P_SYS, SESS, SLOT, SLOT_SMALL, SMALL, TOK_SESSION, TRAY_SLOT,
-    TRAY_SLOT_SMALL, T_MEDIA, T_MEDIA_FAST, WG_SCALE,
+    ART_PX, BAR_H, BAR_H_SMALL, G_COUNT, MAXITEMS, MAXPILLS, MODE, MODE_DOCK, MSG, NITEMS, P_CAL, P_SYS,
+    SLOT, SLOT_SMALL, SMALL, TRAY_SLOT, TRAY_SLOT_SMALL, T_MEDIA, WG_SCALE,
 };
 use super::core_c1::{measure_text, APPS, SEARCH, TRAY_CLOCK};
 use super::state::{
@@ -167,12 +158,9 @@ pub fn pills_ensure() {
 /// Sumber: `static int s_lines` di MediaLog (:1456).
 static S_LINES: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
 
-/// Sumber: MediaClear (:1330).
+/// Sumber: MediaClear (:1330). Dipanggil saat shell keluar: pekerja GSMTC dihentikan dan status dikosongkan.
 pub fn media_clear() {
-    media_unhook();
-    SESS.borrow_mut().take();
-    OP_PROPS.borrow_mut().take();
-    OP_THUMB.borrow_mut().take();
+    media_worker::stop();
     let had = MEDIA.borrow().has;
     if had {
         {
@@ -182,189 +170,108 @@ pub fn media_clear() {
             m.artist[0] = 0;
             m.src[0] = 0;
             m.status = 0;
+            m.art_seq = 0;
             icon_free(&mut m.art);
         }
         media_changed();
     }
 }
 
-/// Sumber: MediaTick (:1343). Keputusan 12: `g_mstat` dihapus, `RequestAsync` dipanggil langsung.
-/// Gagal memanggil `RequestAsync` tidak mengatur ulang timer; T_MEDIA mencoba lagi seperti C (:1360).
+/// Sumber: MediaTick (:1343). 2026-11-15: GSMTC tidak lagi dipoll di thread UI. Fungsi ini hanya memastikan
+/// pekerja GSMTC (media_worker.rs) berjalan, lalu menerapkan snapshot yang sudah ada.
+/// T_MEDIA berhenti setelah pekerja berjalan; bila pembuatan thread gagal, T_MEDIA (3 dtk) mencoba lagi.
 pub fn media_tick() {
-    if MEDIA_FAILED.get() {
+    if media_worker::start(MSG.get()) {
+        kill_timer(T_MEDIA);
+    }
+    media_apply();
+}
+
+fn wide_into(s: &str, out: &mut [u16]) {
+    if out.is_empty() {
         return;
     }
-    if MGR.borrow().is_none() {
-        if OP_MGR.borrow().is_none() {
-            let op = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
-                Ok(op) => op,
-                Err(_) => return,
-            };
-            match op.cast::<IInspectable>() {
-                Ok(o) => *OP_MGR.borrow_mut() = Some(o),
-                Err(_) => return,
-            }
-            set_timer(T_MEDIA_FAST, 150);
-            return;
+    let mut n = 0usize;
+    for c in s.encode_utf16() {
+        if n + 1 >= out.len() {
+            break;
         }
-        let op = OP_MGR.borrow().clone();
-        let Some(op) = op else {
-            return;
-        };
-        let st = async_status(&op);
-        if st == 0 {
-            set_timer(T_MEDIA_FAST, 150);
-            return;
-        }
-        if st == 1 {
-            // GetResults lewat vtable (slot 8 di async_results), lalu cast ke kelas manager; tanpa IAsyncOperation<T>.
-            if let Some(res) = async_results(&op) {
-                if let Ok(m) = res.cast::<GlobalSystemMediaTransportControlsSessionManager>() {
-                    *MGR.borrow_mut() = Some(m);
-                }
-            }
-        }
-        *OP_MGR.borrow_mut() = None;
-        let Some(mgr) = MGR.borrow().clone() else {
-            return;
-        };
-        let handler: TypedEventHandler<
-            GlobalSystemMediaTransportControlsSessionManager,
-            CurrentSessionChangedEventArgs,
-        > = TypedEventHandler::new(|_, _| {
-            media_event();
-            Ok(())
-        });
-        if let Ok(tok) = mgr.CurrentSessionChanged(&handler) {
-            TOK_SESSION.set(tok);
-            MGR_HOOKED.set(true);
-            MEDIA_EV.set(true);
-            kill_timer(T_MEDIA); // mulai sekarang media diperbarui lewat event
-        }
+        out[n] = c;
+        n += 1;
     }
-    let Some(mgr) = MGR.borrow().clone() else {
+    out[n] = 0;
+}
+
+/// Menerapkan snapshot pekerja GSMTC ke `MEDIA` (dipanggil dari WM_W12_MEDIAEV lewat `media_event`).
+/// Perubahan judul, artis, status, atau sampul: relayout + notch. Perubahan garis waktu saja: notch digambar ulang.
+pub fn media_apply() {
+    let Some(sn) = media_worker::take() else {
         return;
     };
-    let sess = match mgr.GetCurrentSession() {
-        Ok(s) => s,
-        Err(_) => {
-            media_clear();
-            return;
-        }
-    };
-    media_hook(&sess);
-    let mut src = [0u16; 256];
-    if let Ok(h) = sess.SourceAppUserModelId() {
-        h_str(&h, &mut src);
-    }
-    let mut status = 0i32;
-    if let Ok(pi) = sess.GetPlaybackInfo() {
-        if let Ok(st) = pi.PlaybackStatus() {
-            status = st.0;
-        }
-    }
-    *SESS.borrow_mut() = Some(sess.clone());
-    let mut changed = false;
+    let mut meta = false;
+    let mut tl = false;
     {
         let mut m = MEDIA.borrow_mut();
-        if !wstr_eq(&src, &m.src) {
-            m.src = src;
-            changed = true;
-        }
-        if status != m.status {
-            m.status = status;
-            changed = true;
-        }
-        if !m.has {
-            m.has = true;
-            changed = true;
+        if !sn.has {
+            if m.has {
+                m.has = false;
+                m.title[0] = 0;
+                m.artist[0] = 0;
+                m.src[0] = 0;
+                m.status = 0;
+                m.art_seq = 0;
+                icon_free(&mut m.art);
+                meta = true;
+            }
+        } else {
+            let mut t = [0u16; 200];
+            let mut a = [0u16; 200];
+            let mut src = [0u16; 256];
+            wide_into(&sn.title, &mut t);
+            wide_into(&sn.artist, &mut a);
+            wide_into(&sn.app, &mut src);
+            if !wstr_eq(&t, &m.title) || !wstr_eq(&a, &m.artist) || !wstr_eq(&src, &m.src) {
+                m.title = t;
+                m.artist = a;
+                m.src = src;
+                meta = true;
+            }
+            if m.status != sn.status || !m.has {
+                m.status = sn.status;
+                m.has = true;
+                meta = true;
+            }
+            if m.tl_start != sn.tl_start || m.tl_end != sn.tl_end || m.tl_pos != sn.tl_pos || m.tl_upd != sn.tl_upd {
+                m.tl_start = sn.tl_start;
+                m.tl_end = sn.tl_end;
+                m.tl_pos = sn.tl_pos;
+                m.tl_upd = sn.tl_upd;
+                tl = true;
+            }
+            m.can_prev = sn.can_prev;
+            m.can_next = sn.can_next;
+            m.can_seek = sn.can_seek;
         }
     }
-    // mode event: judul dibaca saat ada event judul/sesi atau status berubah; mode polling: tiap ~6 detik
-    let want_props = if changed {
-        true
-    } else if MEDIA_EV.get() {
-        MEDIA_WANT.get()
-    } else {
-        let t = MEDIA_TICKS.get().wrapping_add(1);
-        MEDIA_TICKS.set(t);
-        t % 2 == 0
-    };
-    let props_op = OP_PROPS.borrow().clone();
-    if let Some(op) = props_op {
-        let st = async_status(&op);
-        if st != 0 {
-            let mut props: Option<GlobalSystemMediaTransportControlsSessionMediaProperties> = None;
-            if st == 1 {
-                // GetResults lewat vtable (async_results), lalu cast ke kelas properti media.
-                if let Some(res) = async_results(&op) {
-                    props = res.cast::<GlobalSystemMediaTransportControlsSessionMediaProperties>().ok();
-                }
-            }
-            *OP_PROPS.borrow_mut() = None;
-            if let Some(p) = props {
-                let mut t = [0u16; 200];
-                let mut a = [0u16; 200];
-                if let Ok(x) = p.Title() {
-                    h_str(&x, &mut t);
-                }
-                if let Ok(x) = p.Artist() {
-                    h_str(&x, &mut a);
-                }
-                let differs = {
-                    let m = MEDIA.borrow();
-                    !wstr_eq(&t, &m.title) || !wstr_eq(&a, &m.artist)
-                };
-                if differs {
-                    {
-                        let mut m = MEDIA.borrow_mut();
-                        m.title = t;
-                        m.artist = a;
-                        icon_free(&mut m.art);
-                    }
-                    changed = true;
-                    *OP_THUMB.borrow_mut() = None;
-                    // Thumbnail + OpenReadAsync lewat vtable (thumb_begin); tanpa fitur Storage_Streams.
-                    let th = thumb_begin(&p);
-                    *OP_THUMB.borrow_mut() = th;
-                }
-            }
+    if sn.has && sn.art_seq != MEDIA.borrow().art_seq {
+        ART_PX.set(s(56.0));
+        let src = if sn.art_seq == 0 {
+            None
+        } else {
+            media_worker::take_art(sn.art_seq).and_then(|b| decode_art_bytes(&b, ART_PX.get()))
+        };
+        {
+            let mut m = MEDIA.borrow_mut();
+            icon_free(&mut m.art);
+            m.art.src = src;
+            m.art_seq = sn.art_seq;
         }
-    } else if want_props {
-        MEDIA_WANT.set(false);
-        if let Ok(op) = sess.TryGetMediaPropertiesAsync() {
-            *OP_PROPS.borrow_mut() = op.cast::<IInspectable>().ok();
-        }
+        meta = true;
     }
-    let thumb_op = OP_THUMB.borrow().clone();
-    if let Some(op) = thumb_op {
-        let st = async_status(&op);
-        if st != 0 {
-            let mut ras: Option<IUnknown> = None;
-            if st == 1 {
-                // GetResults lewat vtable (async_results); tanpa IAsyncOperation<T>.
-                ras = async_results(&op);
-            }
-            *OP_THUMB.borrow_mut() = None;
-            if let Some(ras) = ras {
-                {
-                    let mut m = MEDIA.borrow_mut();
-                    icon_free(&mut m.art);
-                }
-                ART_PX.set(s(56.0));
-                let art_src = decode_art(&ras, ART_PX.get());
-                MEDIA.borrow_mut().art.src = art_src;
-                changed = true;
-            }
-        }
-    }
-    if changed {
+    if meta {
         media_changed();
-    }
-    // masih menunggu hasil async, atau event judul datang saat permintaan lama berjalan: cek lagi sebentar lagi
-    if OP_PROPS.borrow().is_some() || OP_THUMB.borrow().is_some() || (MEDIA_EV.get() && MEDIA_WANT.get())
-    {
-        set_timer(T_MEDIA_FAST, 150);
+    } else if tl {
+        notch_invalidate();
     }
 }
 
@@ -399,19 +306,47 @@ pub(crate) fn media_log(cmd: i32, src: &str) {
     log(&line);
 }
 
-/// Sumber: MediaCmd (:1467). Argumen default `L"ui"` di C; pemanggil memberi `"ui"` secara eksplisit.
-/// cmd: 0 sebelumnya, 1 putar/jeda, 2 berikutnya.
+/// Sumber: MediaCmd (:1467). cmd: 0 sebelumnya, 1 putar/jeda, 2 berikutnya.
+/// 2026-11-15: perintah diantre ke pekerja GSMTC (media_worker.rs). Putar/jeda langsung dibalik di UI
+/// agar tombol terasa responsif; status asli menyusul lewat event PlaybackInfoChanged.
 pub fn media_cmd(cmd: i32, src: &str) {
     media_log(cmd, src);
-    let Some(sess) = SESS.borrow().clone() else {
+    if !MEDIA.borrow().has {
         return;
+    }
+    let c = match cmd {
+        0 => media_worker::Cmd::Prev,
+        1 => media_worker::Cmd::Toggle,
+        _ => media_worker::Cmd::Next,
     };
-    let _ = match cmd {
-        0 => sess.TrySkipPreviousAsync(),
-        1 => sess.TryTogglePlayPauseAsync(),
-        _ => sess.TrySkipNextAsync(),
-    };
-    set_timer(T_MEDIA_FAST, 350);
+    media_worker::send(c);
+    if cmd == 1 {
+        let flipped = {
+            let mut m = MEDIA.borrow_mut();
+            match m.status {
+                4 => {
+                    m.status = 5;
+                    true
+                }
+                5 => {
+                    m.status = 4;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if flipped {
+            media_changed();
+        }
+    }
+}
+
+/// Seek ke posisi `frac` (0..1) pada garis waktu sesi aktif (dijalankan pekerja GSMTC).
+pub fn media_seek(frac: f32) {
+    if !MEDIA.borrow().has {
+        return;
+    }
+    media_worker::send(media_worker::Cmd::Seek(frac));
 }
 
 // ---- widget dan ukuran dok (win12shell.cpp:1507–1526) ----
@@ -549,19 +484,31 @@ pub fn build_bottom() {
                 add_item(IT_APP, i, G_RIGHT, slot);
             }
         }
+        // 2026-11-15: pengelompokan segmented. `[shell] segrun=1` (bawaan): aplikasi berjalan yang tidak disematkan
+        // mendapat pil sendiri (G_RUN, seperti C++ :1558). segrun=0: digabung ke pil kanan (perilaku port sebelumnya).
+        let run_group = if super::core_c1::ini_int("shell", "segrun", 1) != 0 { super::state::G_RUN } else { G_RIGHT };
         for i in 0..napps {
             let (pin, nw) = app_pin_nw(i);
             if pin < 0 && nw > 0 {
-                // Deviasi dari C++ (:1558 memisahkan G_RUN): aplikasi berjalan digabung ke pil kanan agar tidak ada celah antar pil.
-                add_item(IT_APP, i, G_RIGHT, slot);
+                add_item(IT_APP, i, run_group, slot);
             }
         }
     } else {
-        // satu deret aplikasi mengikuti urutan (bisa digeser)
+        // satu deret aplikasi mengikuti urutan (bisa digeser).
+        // 2026-11-15 Dock: aplikasi berjalan yang tidak disematkan dipisah garis (G_RUN), seperti dok macOS.
+        let dock_split = MODE.get() == MODE_DOCK && super::core_c1::ini_int("shell", "dockrun", 1) != 0;
         for i in 0..napps {
             let (pin, nw) = app_pin_nw(i);
-            if pin >= 0 || nw > 0 {
+            if pin >= 0 || (nw > 0 && !dock_split) {
                 add_item(IT_APP, i, G_LEFT, slot);
+            }
+        }
+        if dock_split {
+            for i in 0..napps {
+                let (pin, nw) = app_pin_nw(i);
+                if pin < 0 && nw > 0 {
+                    add_item(IT_APP, i, super::state::G_RUN, slot);
+                }
             }
         }
     }
@@ -601,7 +548,7 @@ pub fn build_top() {
 
 /// Garis pemisah dok dipasang sebelum grup Left dan Tray (`sepBefore` di C, :1636).
 fn dock_sep_before(g: i32) -> bool {
-    g == G_TRAY || g == G_LEFT
+    g == G_TRAY || g == G_LEFT || g == super::state::G_RUN
 }
 
 /// Menaruh item grup `g` berurutan mulai `start` di pil `pill` (loop `g_items` di C). Mengembalikan X akhir.
@@ -2224,6 +2171,26 @@ pub fn media_source_name(cch: usize) -> String {
             return copy_wide(&a.name, cch);
         }
     }
+    // Sumber video/musik umum yang AUMID-nya tidak terbaca manusia (browser memakai AUMID pendek atau hash).
+    let known: &[(&str, &str)] = &[
+        ("msedge", "Microsoft Edge"),
+        ("chrome", "Google Chrome"),
+        ("308046b0af4a39cb", "Firefox"),
+        ("brave", "Brave"),
+        ("opera", "Opera"),
+        ("vlc", "VLC"),
+        ("microsoft.zunevideo", "Film & TV"),
+        ("microsoft.zunemusic", "Media Player"),
+        ("microsoft.media.player", "Media Player"),
+    ];
+    for (k, name) in known {
+        if ls == *k || ls.starts_with(&format!("{}_", k)) || ls.starts_with(&format!("{}.exe", k)) {
+            return copy_wide(name, cch);
+        }
+    }
+    if ls.contains("zen") && (ls.len() == 16 || ls.ends_with("zen.exe")) {
+        return copy_wide("Zen", cch);
+    }
     let base = match s.rfind('!') {
         Some(i) => &s[i + 1..],
         None => path_file_part(&s),
@@ -2279,16 +2246,18 @@ pub fn draw_item(idx: i32, h: f32) {
             // efek dok: ikon membesar sedikit saat disorot (tetangga ikut sedikit), memantul saat aplikasi dibuka
             let mut mag = 0.0f32;
             if !small && it.pill < NBOTTOM {
-                mag = it.hov * 0.16;
+                // Dock: magnifikasi lebih terasa (ala macOS); mode lain tetap halus.
+                let (k0, k1) = if dock { (0.24, 0.09) } else { (0.16, 0.05) };
+                mag = it.hov * k0;
                 if let Some(p) = prev {
                     if p.ty == IT_APP && p.pill == it.pill {
-                        mag = mag.max(p.hov * 0.05);
+                        mag = mag.max(p.hov * k1);
                     }
                 }
                 if idx + 1 < NITEMS.get() {
                     if let Some(n) = next {
                         if n.ty == IT_APP && n.pill == it.pill {
-                            mag = mag.max(n.hov * 0.05);
+                            mag = mag.max(n.hov * k1);
                         }
                     }
                 }

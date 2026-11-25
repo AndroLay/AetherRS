@@ -337,6 +337,54 @@ fn wl_captive_portal() -> bool {
     need
 }
 
+/// SSID Wi-Fi yang sedang tersambung (peringatan notch, net_watch.rs). None bila tidak tersambung atau WLAN tidak ada.
+pub(crate) fn wifi_current_ssid() -> Option<String> {
+    let mut neg = 0u32;
+    let mut h = HANDLE(std::ptr::null_mut());
+    // SAFETY: semua penunjuk menunjuk variabel lokal; handle ditutup di akhir fungsi.
+    if unsafe { wlan_open_handle(2, std::ptr::null(), &mut neg, &mut h) } != 0 || h.0.is_null() {
+        return None;
+    }
+    let mut out = None;
+    let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+    // SAFETY: list diisi WlanEnumInterfaces dan dibebaskan dengan WlanFreeMemory.
+    unsafe {
+        if wlan_enum_interfaces(h, std::ptr::null(), &mut list) == 0 && !list.is_null() {
+            let n = (*list).dwNumberOfItems as usize;
+            let base = (*list).InterfaceInfo.as_ptr();
+            for i in 0..n {
+                let info = &*base.add(i);
+                let mut sz = 0u32;
+                let mut vt = WLAN_OPCODE_VALUE_TYPE(0);
+                let mut data: *mut c_void = std::ptr::null_mut();
+                let rc = wlan_query_interface(
+                    h,
+                    &info.InterfaceGuid,
+                    wlan_intf_opcode_current_connection,
+                    std::ptr::null(),
+                    &mut sz,
+                    &mut data,
+                    &mut vt,
+                );
+                if rc == 0 && !data.is_null() {
+                    let ca = data.cast::<WLAN_CONNECTION_ATTRIBUTES>();
+                    if (*ca).isState.0 == wlan_interface_state_connected.0 {
+                        let cs = ssid_copy(&(*ca).wlanAssociationAttributes.dot11Ssid);
+                        out = Some(wl_ssid(&cs));
+                    }
+                    wlan_free_memory(data);
+                }
+                if out.is_some() {
+                    break;
+                }
+            }
+            wlan_free_memory(list as *const c_void);
+        }
+        let _ = wlan_close_handle(h, std::ptr::null());
+    }
+    out.filter(|s: &String| !s.is_empty())
+}
+
 /// Membaca koneksi aktif dan daftar jaringan ke `r` (sumber WlRead, baris 128-194).
 fn wl_read(h: HANDLE, g: &GUID, r: &mut WlRes) {
     let mut cs = DOT11_SSID {

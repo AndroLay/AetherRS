@@ -54,6 +54,9 @@ pub fn on_timer(id: i32) {
             let v = VOL.get();
             let was_net = NET.get();
             let mut ch = net_update();
+            if ch {
+                super::net_watch::on_change(was_net);
+            }
             ch = battery_update() || ch;
             volume_attach();
             ch = ch || v != VOL.get() || mu != MUTE.get();
@@ -126,6 +129,16 @@ pub fn on_timer(id: i32) {
             kill_timer(T_MEDIA_FAST);
             media_tick();
         }
+        T_NETCHK => {
+            kill_timer(T_NETCHK);
+            super::net_watch::on_timer();
+        }
+        T_ALLSCROLL => super::start_draw::all_apps_tick(),
+        T_APPIDX_DEBOUNCE => {
+            kill_timer(T_APPIDX_DEBOUNCE);
+            st_idx_refresh_now();
+        }
+        T_APPIDX_POLL => st_idx_refresh_now(),
         T_REFRESH => {
             kill_timer(T_REFRESH);
             refresh_windows();
@@ -167,15 +180,15 @@ pub fn on_timer(id: i32) {
 // saat thread UI sibuk. Win tunggal dan Ctrl+Esc membuka/menutup Start Win12; Win+S membuka Start untuk pencarian.
 // Kombinasi Win lainnya dan Ctrl/Shift/Alt+Win tetap ke Windows. Start bawaan ditahan pada pintasan yang dialihkan.
 
-static KB_HOOK: SyncCell<Cell<HHOOK>> = SyncCell::new(Cell::new(HHOOK(std::ptr::null_mut())));
-static KB_THREAD: SyncCell<Cell<HANDLE>> = SyncCell::new(Cell::new(HANDLE(std::ptr::null_mut())));
-static KB_TID: SyncCell<Cell<u32>> = SyncCell::new(Cell::new(0));
+static KB_HOOK: crate::sync::AtomicHandle<HHOOK> = crate::sync::AtomicHandle::null();
+static KB_THREAD: crate::sync::AtomicHandle<HANDLE> = crate::sync::AtomicHandle::null();
+static KB_TID: crate::sync::AtomicU32Cell = crate::sync::AtomicU32Cell::new(0);
 // Status Win; hanya dipakai thread kait (C++ g_winDown, g_winCombo, g_winSearch, g_winSSwallowed, g_ctrlEscPending).
-static KB_WIN_DOWN: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-static KB_WIN_COMBO: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-static KB_WIN_SEARCH: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-static KB_WIN_SS_SWALLOWED: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-static KB_CTRL_ESC_PENDING: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+static KB_WIN_DOWN: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
+static KB_WIN_COMBO: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
+static KB_WIN_SEARCH: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
+static KB_WIN_SS_SWALLOWED: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
+static KB_CTRL_ESC_PENDING: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
 
 /// Pembungkus GetAsyncKeyState (C++ memakai `GetAsyncKeyState(vk) < 0` langsung).
 #[inline]
@@ -207,6 +220,34 @@ unsafe extern "system" fn kb_hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRE
             let win = vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32;
             let msg = wp.0 as u32;
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+
+            // Pulihkan status Win bila pelepasan Win tidak sampai ke kait (mis. Win+L: pelepasan terjadi di
+            // desktop kunci). Tanpa ini, angka/panah/huruf pintasan tertelan sampai Win ditekan lagi.
+            if KB_WIN_DOWN.get() && !win && ak(VK_LWIN.0 as u32) >= 0 && ak(VK_RWIN.0 as u32) >= 0 {
+                KB_WIN_DOWN.set(false);
+                KB_WIN_COMBO.set(false);
+                KB_WIN_SEARCH.set(false);
+            }
+
+            // Mode game (jendela depan fullscreen, Explorer masih shell): hanya tombol Win dan kombinasinya yang diproses.
+            // Tombol lain, termasuk volume dan Ctrl+Esc, langsung diteruskan ke game/Windows tanpa logika shell.
+            if GAME_FS.load(std::sync::atomic::Ordering::Relaxed) && !SHELL_MODE.get() && !win && !KB_WIN_DOWN.get() {
+                return CallNextHookEx(Some(KB_HOOK.get()), code, wp, lp);
+            }
+
+            // Tombol volume: ditelan di sini agar OSD volume bawaan Windows tidak muncul. Perubahan volume
+            // dilakukan shell (shell_app_command) dan ditampilkan di notch lewat WM_VOLCHG.
+            if matches!(vk, 0xAD | 0xAE | 0xAF) && !MSG.get().0.is_null() {
+                if down {
+                    let cmd = match vk {
+                        0xAF => APPCOMMAND_VOLUME_UP.0,
+                        0xAE => APPCOMMAND_VOLUME_DOWN.0,
+                        _ => APPCOMMAND_VOLUME_MUTE.0,
+                    };
+                    vol_key_post(cmd);
+                }
+                return LRESULT(1);
+            }
 
             if SHELL_MODE.get() {
                 let r = tasks_key(k, wp.0, KB_WIN_DOWN.get());
@@ -364,7 +405,24 @@ unsafe extern "system" fn kb_thread(_param: *mut c_void) -> u32 {
     let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook_proc), Some(HI.get()), 0).ok();
     KB_HOOK.set(hook.unwrap_or(HHOOK(std::ptr::null_mut())));
     let mut m: MSG = std::mem::zeroed();
-    while GetMessageW(&mut m, None, 0, 0).0 > 0 {}
+    // Windows melepas kait LL diam-diam bila sekali saja melewati LowLevelHooksTimeout (mis. CPU penuh saat game).
+    // Akibatnya tombol Win tidak lagi membuka Start. Kait dipasang ulang tiap 20 dtk saat Win tidak ditahan.
+    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(None, 0, 20_000, None);
+    while GetMessageW(&mut m, None, 0, 0).0 > 0 {
+        // Jangan pasang ulang kait saat game fullscreen aktif (di luar mode shell) agar tidak memicu stutter/anti-cheat.
+        let game_active = GAME_FS.load(std::sync::atomic::Ordering::Relaxed) && !SHELL_MODE.get();
+        if m.message == windows::Win32::UI::WindowsAndMessaging::WM_TIMER && !KB_WIN_DOWN.get() && !game_active {
+            let old = KB_HOOK.get();
+            if !old.0.is_null() {
+                let _ = UnhookWindowsHookEx(old);
+            }
+            let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook_proc), Some(HI.get()), 0).ok();
+            KB_HOOK.set(hook.unwrap_or(HHOOK(std::ptr::null_mut())));
+            if hook.is_none() {
+                crate::log::log("kait keyboard: pasang ulang gagal");
+            }
+        }
+    }
     if !KB_HOOK.get().0.is_null() {
         let _ = UnhookWindowsHookEx(KB_HOOK.get());
         KB_HOOK.set(HHOOK(std::ptr::null_mut()));
@@ -655,6 +713,16 @@ pub fn shell_app_command(cmd: i32, dev: u32) -> bool {
     }
 }
 
+/// Antre tombol volume ke thread UI (dipanggil dari kait keyboard dan roda pada pil volume).
+pub fn vol_key_post(cmd: u32) {
+    let _ = unsafe { PostMessageW(Some(MSG.get()), WM_W12_VOLKEY, WPARAM(cmd as usize), LPARAM(0)) };
+}
+
+/// Roda mouse di pil volume: satu langkah per notch roda (sama seperti tombol volume, tanpa OSD Windows).
+pub fn vol_wheel_post(up: bool) {
+    vol_key_post(if up { APPCOMMAND_VOLUME_UP.0 } else { APPCOMMAND_VOLUME_DOWN.0 });
+}
+
 /// Hancurkan jendela bila ada lalu kosongkan handle-nya (pola C: `if (g_x) { DestroyWindow(g_x); g_x = nullptr; }`).
 fn destroy_win(cell: &SyncCell<Cell<HWND>>) {
     let h = cell.get();
@@ -666,6 +734,7 @@ fn destroy_win(cell: &SyncCell<Cell<HWND>>) {
 
 /// C++ Shutdown. Urutan langkah sama dengan C. Dipanggil dari WM_DESTROY / akhir wWinMain.
 pub fn shutdown_app() {
+    log("keluar: shutdown_app mulai");
     QUITTING.set(true);
     kill_timer(T_START_TRIM);
     kb_hook_stop();
@@ -740,6 +809,7 @@ pub fn shutdown_app() {
     }
     *OP_MGR.borrow_mut() = None;
     *MGR.borrow_mut() = None;
+    log("keluar: shutdown_app selesai");
 }
 
 // ---------------------------------------------------------------- MsgProc (C++ 4931-5080)
@@ -908,6 +978,11 @@ pub unsafe extern "system" fn msg_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
             st_idx_install(lp);
             return LRESULT(0);
         }
+        WM_W12_STARTNOTIFY => {
+            // perubahan folder Start Menu/AppsFolder (start.rs st_idx_register_notify); debounce lalu pindai ulang
+            st_idx_notify_changed();
+            return LRESULT(0);
+        }
         WM_W12_FXHITS => {
             // hasil pencarian berkas; wp = generasi, lp = FsResult* (filesearch.rs)
             if unsafe { fs_accept_hits(wp.0 as i32, lp.0 as usize as *mut FsResult) } {
@@ -941,6 +1016,21 @@ pub unsafe extern "system" fn msg_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
         WM_W12_MEDIAEV => {
             // sesi/status/judul media berubah
             media_event();
+            return LRESULT(0);
+        }
+        WM_W12_NOTIF => {
+            // notifikasi Windows baru -> kartu notch
+            super::notif_worker::deliver();
+            return LRESULT(0);
+        }
+        WM_W12_VOLKEY => {
+            // tombol volume dari kait keyboard / roda (lihat kb_hook_proc)
+            shell_app_command(wp.0 as i32, FAPPCOMMAND_OEM);
+            return LRESULT(0);
+        }
+        WM_W12_LYRIC => {
+            // lirik lagu aktif sudah diambil (lyrics.rs): gambar ulang pulau/notch
+            super::notch::notch_invalidate();
             return LRESULT(0);
         }
         WM_TIMER => {
@@ -984,13 +1074,18 @@ pub unsafe extern "system" fn msg_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) 
             // Penerima WAJIB mengambil alih kepemilikan dengan Box::from_raw.
             if lp.0 != 0 {
                 let s: String = *unsafe { Box::from_raw(lp.0 as usize as *mut String) };
-                hk_need_explorer(s);
+                if wp.0 == 1 {
+                    crate::shell::hotkeys::hk_temp_explorer(s);
+                } else {
+                    hk_need_explorer(s);
+                }
             }
             return LRESULT(0);
         }
         WM_NETCHG => {
             let was = NET.get();
             if net_update() {
+                super::net_watch::on_change(was);
                 if (was == NET_BOTH) != (NET.get() == NET_BOTH) {
                     relayout();
                 } else {
@@ -1516,6 +1611,10 @@ pub fn w_win_main() -> i32 {
     // C++ 5229-5237: ikon catatan, aplikasi, jam, jaringan, baterai, USB, volume, menu.
     NOTE_ICON.borrow_mut().src = icon_from_parsing_name(NOTE_APP, icon_size());
     load_apps();
+    // Indeks aplikasi: pemberitahuan folder Start Menu, pemindaian awal, dan pemindaian berkala (start.rs, 2026-11-24).
+    st_idx_register_notify();
+    st_idx_refresh_now();
+    set_timer(T_APPIDX_POLL, APPIDX_POLL_MS);
     clock_update();
     net_init();
     net_update();
@@ -1573,6 +1672,8 @@ pub fn w_win_main() -> i32 {
     set_timer(T_STATUS, 10000);
     set_timer(T_MEDIA, 3000);
     media_tick();
+    super::net_watch::start();
+    super::notif_worker::start(MSG.get());
     set_timer(T_TRIM, 4000);
     set_timer(T_FGPOLL, 500);
     set_timer(T_WALLPAPER, 15000);
@@ -1587,6 +1688,7 @@ pub fn w_win_main() -> i32 {
             DispatchMessageW(&msg);
         }
     }
+    log("keluar: loop pesan selesai");
 
     // C++ 5274-5282: lepas mutex; bila "Beralih ke Windows biasa", jalankan explorer.exe.
     if let Some(m) = mtx {
@@ -1601,5 +1703,6 @@ pub fn w_win_main() -> i32 {
             ShellExecuteW(None, w!("open"), pcw(&to_wide_z(&path)), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
         };
     }
+    log("keluar: wWinMain selesai");
     0
 }

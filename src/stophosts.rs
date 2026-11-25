@@ -3,7 +3,7 @@
 //! Tes di `tests/stophosts.rs` memakai data in-memory. Nama kanonik dikembalikan sebagai `&str` (ASCII).
 
 /// Jumlah nama di whitelist (`W12STOP_COUNT`). Tipe `usize` karena dipakai sebagai ukuran array.
-pub const W12STOP_COUNT: usize = 4;
+pub const W12STOP_COUNT: usize = 8;
 /// Jumlah kemunculan yang dicatat per nama (`W12STOP_LIMIT`). Tipe `usize` karena dipakai sebagai ukuran array.
 pub const W12STOP_LIMIT: usize = 3;
 
@@ -20,6 +20,11 @@ pub const W12_STOP_NAME_TABLE: [&str; W12STOP_COUNT] = [
     "StartMenuExperienceHost.exe",
     "ShellHost.exe",
     "ShellExperienceHost.exe",
+    // 2026-11-18 (permintaan pengguna: tetap mati): proses latar yang menyala lagi sendiri.
+    "CrossDeviceResume.exe",
+    "AppActions.exe",
+    "SDXHelper.exe",
+    "SpotifyLauncher.exe",
 ];
 
 /// Huruf ASCII A..Z menjadi a..z; unit lain tidak diubah (`W12StopLower`).

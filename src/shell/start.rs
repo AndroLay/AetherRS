@@ -26,17 +26,22 @@ use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO,
     CMINVOKECOMMANDINFOEX, FOLDERID_AppsFolder, IContextMenu, IContextMenu2, IContextMenu3,
-    IEnumShellItems, IShellFolder, IShellItem, KF_FLAG_DEFAULT, SHBindToParent,
+    IEnumShellItems, IShellFolder, IShellItem, IShellItem2, KF_FLAG_DEFAULT, SHBindToParent,
     SHGetKnownFolderItem, SHParseDisplayName, ShellExecuteW, SIGDN_NORMALDISPLAY,
-    SIGDN_PARENTRELATIVEPARSING,
+    SIGDN_PARENTRELATIVEPARSING, FOLDERID_CommonPrograms, FOLDERID_Programs, SHCNRF_SOURCE,
+    SHChangeNotifyEntry, SHChangeNotifyRegister, SHGetKnownFolderIDList,
 };
+use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, PrivateExtractIconsW, HICON};
+use windows::core::Interface;
+use windows::Win32::Graphics::Imaging::IWICBitmapSource;
 
 use super::prelude::*;
 
 // Ukuran panel dan batas daftar (w12start.inc:17-18).
 pub const START_W: i32 = 780;
-pub const START_H: i32 = 618;
-pub const START_PINS: i32 = 18;
+/// 2026-11-15: 618 -> 680 agar Disematkan muat 4 baris (24 aplikasi).
+pub const START_H: i32 = 680;
+pub const START_PINS: i32 = 24;
 pub const START_MAXQ: i32 = 63;
 pub const START_HITS: i32 = 24;
 pub const ST_APP_INDEX_MAX: i32 = 4000;
@@ -59,6 +64,8 @@ pub struct StIdx {
     pub name: String,
     pub id: String,
     pub fields: W12SearchFields,
+    /// Jalur exe asli (PKEY target); kosong bila bukan berkas berhuruf drive. Ikon diambil dari sini bila ada.
+    pub exe: String,
     pub icon: Icon,
     pub icon_tried: bool,
 }
@@ -68,11 +75,14 @@ pub struct StIdxEntry {
     pub name: String,
     pub id: String,
     pub fields: W12SearchFields,
+    pub exe: String,
 }
 
 /// Paket hasil thread latar (`StIdxBuild`, :22). Dikirim ke UI lewat LPARAM sebagai `Box`.
 pub struct StIdxBuild {
     pub v: Vec<StIdxEntry>,
+    /// Lama enumerasi di thread latar (ms), untuk catatan log.
+    pub ms: u32,
 }
 
 /// Katalog pengaturan (`StSetting`, :24). Nama dan keyword ditulis tetap; bidang pencarian dibangun saat dibutuhkan.
@@ -112,6 +122,16 @@ pub static ST_IDX: SyncCell<RefCell<Vec<StIdx>>> = SyncCell::new(RefCell::new(Ve
 pub static ST_IDX_BUSY: AtomicBool = AtomicBool::new(false);
 pub static ST_IDX_TICK: SyncCell<Cell<u32>> = SyncCell::new(Cell::new(0));
 pub static ST_IDX_GEN: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
+/// Indeks perlu dipindai ulang: ada perubahan Start Menu/AppsFolder yang belum tercermin (2026-11-24).
+pub static ST_IDX_DIRTY: AtomicBool = AtomicBool::new(false);
+/// Pemberitahuan shell untuk folder Start Menu sudah terdaftar (2026-11-24).
+pub static ST_NOTIFY_ON: AtomicBool = AtomicBool::new(false);
+/// Debounce setelah pemberitahuan perubahan, dalam ms.
+pub const APPIDX_DEBOUNCE_MS: u32 = 1_500;
+/// Pemindaian berkala indeks, dalam ms. Menangkap aplikasi Store/paket yang tidak memberi pemberitahuan.
+pub const APPIDX_POLL_MS: u32 = 60_000;
+/// SHCNE_ALLEVENTS (nilai sama dengan desk_icons.rs).
+const ST_SHCNE_ALL: i32 = 0x7FFF_FFFF;
 pub static ST_HITS: SyncCell<RefCell<Vec<StHit>>> = SyncCell::new(RefCell::new(Vec::new()));
 pub static ST_N_HITS: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
 pub static ST_SEL: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
@@ -255,6 +275,47 @@ fn st_take_pwstr(p: PWSTR) -> String {
     }
 }
 
+/// Jalur exe asli item AppsFolder (PKEY target, seperti `app_from_shell_item`). Kosong bila tidak berupa path
+/// berhuruf drive (mis. aplikasi Store/UWP).
+fn st_idx_exe(item: &IShellItem) -> String {
+    let Ok(si2) = item.cast::<IShellItem2>() else {
+        return String::new();
+    };
+    // SAFETY: GetString dengan kunci properti tetap; PWSTR hasilnya dibebaskan oleh st_take_pwstr.
+    let Ok(p) = (unsafe { si2.GetString(&PK_TARGET) }) else {
+        return String::new();
+    };
+    let target = st_take_pwstr(p);
+    let b = target.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+        target
+    } else {
+        String::new()
+    }
+}
+
+/// Ikon langsung dari berkas exe di disk (`PrivateExtractIconsW`), melewati cache ikon shell yang bisa basi
+/// setelah exe diperbarui. Tidak ada alokasi tetap: satu HICON dibuat lalu langsung dilepas. None bila gagal.
+fn st_exe_icon(path: &str, px: i32) -> Option<IWICBitmapSource> {
+    if path.is_empty() || path.encode_utf16().count() >= 260 {
+        return None;
+    }
+    let mut buf = [0u16; 260];
+    for (i, c) in path.encode_utf16().enumerate() {
+        buf[i] = c;
+    }
+    let mut hi = [HICON(null_mut())];
+    // SAFETY: buf berakhir NUL (sisa nol) dan hidup selama pemanggilan; hi punya satu slot untuk ikon pertama.
+    let _ = unsafe { PrivateExtractIconsW(&buf, 0, px, px, Some(&mut hi), None, 0) };
+    if hi[0].0.is_null() {
+        return None;
+    }
+    let out = icon_from_hicon(hi[0], px);
+    // SAFETY: HICON ini dibuat PrivateExtractIconsW di atas dan belum pernah dilepas.
+    let _ = unsafe { DestroyIcon(hi[0]) };
+    out
+}
+
 /// Mengenumerasi shell:AppsFolder (`StIdxThread` :154-205). Entri dengan nama/ID kosong, atau yang gagal
 /// dibangun bidang pencariannya, dilewati tanpa membatalkan enumerasi. Semua objek COM dilepas di sini.
 fn st_idx_enumerate() -> Vec<StIdxEntry> {
@@ -287,10 +348,15 @@ fn st_idx_enumerate() -> Vec<StIdxEntry> {
             if name.is_empty() || id.is_empty() {
                 continue;
             }
-            let Some(fields) = w12_search_build_fields(&name) else {
+            // "File Explorer" dibuka sebagai Win12 Explorer (shell_open_with); kata lama tetap bisa dicari.
+            let explorer = id.eq_ignore_ascii_case("Microsoft.Windows.Explorer");
+            let name = if explorer { "Win12 Explorer".to_string() } else { name };
+            let search = if explorer { format!("{name} File Explorer") } else { name.clone() };
+            let Some(fields) = w12_search_build_fields(&search) else {
                 continue;
             };
-            out.push(StIdxEntry { name, id, fields });
+            let exe = st_idx_exe(&item);
+            out.push(StIdxEntry { name, id, fields, exe });
         }
     }
     out
@@ -301,12 +367,14 @@ fn st_idx_thread(host: isize) {
     // SAFETY: CoInitializeEx dipasangkan dengan CoUninitialize hanya bila pemanggilannya berhasil (S_OK atau S_FALSE).
     let co = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let uninit = co.is_ok();
+    let t0 = std::time::Instant::now();
     let v = st_idx_enumerate();
+    let ms = t0.elapsed().as_millis() as u32;
     if uninit {
         // SAFETY: pasangan dari CoInitializeEx yang berhasil di atas.
         unsafe { CoUninitialize() };
     }
-    let build = Box::into_raw(Box::new(StIdxBuild { v }));
+    let build = Box::into_raw(Box::new(StIdxBuild { v, ms }));
     // SAFETY: host adalah HWND jendela utama; LPARAM membawa pointer StIdxBuild yang kepemilikannya pindah ke penerima.
     let posted = unsafe {
         PostMessageW(
@@ -319,49 +387,142 @@ fn st_idx_thread(host: isize) {
     if posted.is_err() {
         // SAFETY: pointer dari Box::into_raw di atas belum diterima siapa pun; dikembalikan ke Box agar dibebaskan.
         drop(unsafe { Box::from_raw(build) });
+        ST_IDX_DIRTY.store(true, AtomicOrdering::SeqCst);
         ST_IDX_BUSY.store(false, AtomicOrdering::SeqCst);
     }
 }
 
-/// Memulai pembaruan indeks di thread latar bila belum pernah dipasang atau sudah lebih dari 10 menit (`StIdxRefresh` :242-249).
+/// Memulai pembaruan indeks di thread latar bila belum pernah dipasang atau sudah lebih dari 3 detik sejak
+/// pembaruan terakhir (`StIdxRefresh` :242-249). 2026-11-16: sebelumnya 10 menit, sehingga aplikasi yang baru
+/// dipasang tidak muncul di Start sampai cache habis. Enumerasi dilakukan di thread latar dan ikon hanya
+/// dimuat ulang bila daftarnya berubah (lihat `st_idx_install`).
 pub fn st_idx_refresh() {
     // SAFETY: GetTickCount tidak punya prasyarat.
     let now = unsafe { GetTickCount() };
-    if ST_IDX_LOADED.get() && now.wrapping_sub(ST_IDX_TICK.get()) < 600_000 {
+    if ST_IDX_LOADED.get() && now.wrapping_sub(ST_IDX_TICK.get()) < 3_000 {
         return;
     }
+    st_idx_spawn();
+}
+
+/// Menjalankan enumerasi di thread latar bila tidak sedang berjalan. Mengembalikan false bila tidak dimulai.
+fn st_idx_spawn() -> bool {
     if ST_IDX_BUSY
         .compare_exchange(false, true, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
         .is_err()
     {
-        return;
+        return false;
     }
+    // Enumerasi dimulai sekarang: perubahan yang terjadi sesudah ini menandai indeks kotor lagi.
+    ST_IDX_DIRTY.store(false, AtomicOrdering::SeqCst);
     let host = MSG.get().0 as isize;
     let spawned = std::thread::Builder::new()
         .name("w12-appidx".into())
         .spawn(move || st_idx_thread(host));
     if spawned.is_err() {
+        ST_IDX_DIRTY.store(true, AtomicOrdering::SeqCst);
         ST_IDX_BUSY.store(false, AtomicOrdering::SeqCst);
+        return false;
     }
+    true
+}
+
+/// Pemindaian ulang tanpa throttle: dipakai debounce pemberitahuan, pemindaian berkala, dan saat startup.
+/// Bila enumerasi masih berjalan, indeks ditandai kotor; `st_idx_install` lalu menjadwalkan pemindaian lagi.
+pub fn st_idx_refresh_now() {
+    if ST_IDX_BUSY.load(AtomicOrdering::SeqCst) {
+        ST_IDX_DIRTY.store(true, AtomicOrdering::SeqCst);
+        return;
+    }
+    st_idx_spawn();
+}
+
+/// Pemberitahuan perubahan Start Menu (WM_W12_STARTNOTIFY): tandai kotor dan mulai debounce. Pemberitahuan yang
+/// datang beruntun hanya memicu satu pemindaian, setelah jeda `APPIDX_DEBOUNCE_MS` tanpa perubahan baru.
+pub fn st_idx_notify_changed() {
+    ST_IDX_DIRTY.store(true, AtomicOrdering::SeqCst);
+    set_timer(T_APPIDX_DEBOUNCE, APPIDX_DEBOUNCE_MS);
+}
+
+/// Mendaftarkan pemberitahuan shell untuk folder Start Menu (semua pengguna dan pengguna aktif, rekursif) serta
+/// AppsFolder. Dipanggil sekali saat startup. Bila gagal, perubahan tetap tertangkap pemindaian berkala.
+pub fn st_idx_register_notify() {
+    if ST_NOTIFY_ON.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    let h = MSG.get();
+    if h.0.is_null() {
+        return;
+    }
+    let mut entries: Vec<SHChangeNotifyEntry> = Vec::new();
+    // SAFETY: pidl dari SHGetKnownFolderIDList dibiarkan hidup selama proses (SHChangeNotifyRegister merujuknya).
+    unsafe {
+        for (fid, rekursif) in [
+            (&FOLDERID_CommonPrograms, true),
+            (&FOLDERID_Programs, true),
+            (&FOLDERID_AppsFolder, false),
+        ] {
+            if let Ok(p) = SHGetKnownFolderIDList(fid, 0, None) {
+                entries.push(SHChangeNotifyEntry { pidl: p, fRecursive: rekursif.into() });
+            }
+        }
+        if entries.is_empty() {
+            crate::log::log("appidx: folder Start Menu tidak ditemukan; hanya pemindaian berkala");
+            return;
+        }
+        // SHCNRF_InterruptLevel | SHCNRF_ShellLevel (pola desk_icons.rs ensure_notify).
+        let id = SHChangeNotifyRegister(
+            h,
+            SHCNRF_SOURCE(0x1 | 0x2),
+            ST_SHCNE_ALL,
+            WM_W12_STARTNOTIFY,
+            entries.len() as i32,
+            entries.as_ptr(),
+        );
+        if id == 0 {
+            crate::log::log("appidx: SHChangeNotifyRegister gagal; hanya pemindaian berkala");
+            return;
+        }
+    }
+    ST_NOTIFY_ON.store(true, AtomicOrdering::SeqCst);
 }
 
 /// Memasang hasil indeks dari thread latar (`StIdxInstall` :221-240). Dipanggil dari WM_W12_APPIDX (core_c4b).
 pub fn st_idx_install(lp: LPARAM) {
     ST_IDX_BUSY.store(false, AtomicOrdering::SeqCst);
+    // Perubahan yang datang selama enumerasi belum tercermin: jadwalkan pemindaian ulang.
+    if ST_IDX_DIRTY.load(AtomicOrdering::SeqCst) {
+        set_timer(T_APPIDX_DEBOUNCE, APPIDX_DEBOUNCE_MS);
+    }
     if lp.0 == 0 {
         return;
     }
     // SAFETY: lp berisi pointer dari Box::into_raw di st_idx_thread; pesan ini hanya diterima sekali.
-    let StIdxBuild { v } = *unsafe { Box::from_raw(lp.0 as *mut StIdxBuild) };
+    let StIdxBuild { v, ms } = *unsafe { Box::from_raw(lp.0 as *mut StIdxBuild) };
     if v.is_empty() && ST_IDX_LOADED.get() {
         return;
     }
+    // 2026-11-16: daftar sama dengan yang sudah ada → pertahankan ikon yang sudah dimuat (tanpa kedip).
+    if ST_IDX_LOADED.get() {
+        let same = {
+            let idx = ST_IDX.borrow();
+            idx.len() == v.len()
+                && idx.iter().zip(v.iter()).all(|(a, b)| a.name == b.name && a.id == b.id && a.exe == b.exe)
+        };
+        if same {
+            // SAFETY: GetTickCount tidak punya prasyarat.
+            ST_IDX_TICK.set(unsafe { GetTickCount() });
+            return;
+        }
+    }
+    let n = v.len();
     let fresh: Vec<StIdx> = v
         .into_iter()
         .map(|e| StIdx {
             name: e.name,
             id: e.id,
             fields: e.fields,
+            exe: e.exe,
             icon: Icon::new(),
             icon_tried: false,
         })
@@ -375,8 +536,10 @@ pub fn st_idx_install(lp: LPARAM) {
     // SAFETY: GetTickCount tidak punya prasyarat.
     ST_IDX_TICK.set(unsafe { GetTickCount() });
     ST_N_HITS.set(0);
+    crate::log::log(&format!("appidx: daftar berubah, {n} aplikasi (enumerasi {ms} ms)"));
     st_search();
-    if PANEL_OPEN.get() == PN_START && (ST_Q_LEN.get() != 0 || ST_ALL_APPS_MODE.get()) {
+    // Start terbuka: gambar ulang agar aplikasi baru langsung terlihat, tidak hanya saat mengetik atau di Semua aplikasi.
+    if PANEL_OPEN.get() == PN_START {
         let pan = PAN.get();
         if !pan.0.is_null() {
             // pan adalah HWND panel yang non-null; w12_invalidate memposting WM_W12_RENDER untuk panel berlapis.
@@ -390,6 +553,12 @@ pub fn st_idx_install(lp: LPARAM) {
 // ---------------------------------------------------------------------------
 
 /// Membatalkan cache daftar semua aplikasi (`StAllAppsInvalidate` :251-255).
+/// Jumlah baris "Semua aplikasi". 2026-11-15: sebelumnya kode memakai `ST_ALL_N_APPS`, padahal itu kunci cache
+/// (jumlah APPS taskbar, ±10), sehingga hanya ±10 baris pertama (semua berawalan A) yang tampil dan bisa dipilih.
+pub fn st_all_len() -> i32 {
+    ST_ALL_APPS.borrow().len() as i32
+}
+
 pub fn st_all_apps_invalidate() {
     ST_ALL_IDX_GEN.set(-1);
     ST_ALL_N_APPS.set(-1);
@@ -412,7 +581,7 @@ pub fn st_all_app_name(r: StAllAppRef) -> String {
 }
 
 /// Huruf pertama nama dalam huruf kecil, untuk urutan dan lompat huruf. Nama kosong → '\0'.
-fn st_first_lower(name: &str) -> char {
+pub fn st_first_lower(name: &str) -> char {
     name.chars()
         .next()
         .map(|c| c.to_lowercase().next().unwrap_or(c))
@@ -560,8 +729,8 @@ pub fn start_all_apps_jump_to_letter(letter: i32) {
     let target = char::from(b'a' + letter as u8);
     let lo = names.partition_point(|&c| c < target).min(n - 1);
     ST_ALL_SELECTED.set(lo as i32);
-    ST_ALL_SCROLL.set(lo as i32 * st_all_row_step());
-    st_all_apps_clamp_scroll();
+    // 2026-11-15: gulir halus ke huruf, bukan lompat
+    super::start_draw::all_scroll_to(lo as i32 * st_all_row_step());
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1230,7 @@ fn start_app_parsing_name(index: usize) -> Option<String> {
 
 /// Nama parsing untuk id panel (C++ `StartContextParsingName`, :572-607).
 fn start_context_parsing_name(hit: i32) -> Option<String> {
-    if hit >= PAN_ID_START_ALL_APP && hit - PAN_ID_START_ALL_APP < ST_ALL_N_APPS.get() {
+    if hit >= PAN_ID_START_ALL_APP && hit - PAN_ID_START_ALL_APP < st_all_len() {
         return st_all_app_parsing_name(hit - PAN_ID_START_ALL_APP);
     }
     let r = start_context_ref(hit);
@@ -1151,7 +1320,7 @@ fn start_pan_ease() -> f32 {
 /// Id baris yang dipilih lewat keyboard (C++ `StartKeyboardContextHit`, :625-634).
 fn start_keyboard_context_hit() -> Option<i32> {
     let sel = ST_ALL_SELECTED.get();
-    if ST_ALL_APPS_MODE.get() && ST_Q_LEN.get() == 0 && sel >= 0 && sel < ST_ALL_N_APPS.get() {
+    if ST_ALL_APPS_MODE.get() && ST_Q_LEN.get() == 0 && sel >= 0 && sel < st_all_len() {
         return Some(PAN_ID_START_ALL_APP + sel);
     }
     let sel = ST_SEL.get();
@@ -1184,47 +1353,65 @@ fn start_context_track(owner: HWND, pt: POINT, parsing: &str, file_hit: bool) {
         }
     }
 
+    // 2026-11-15: menu Win12 (Buka, admin, sematkan Start/taskbar, lokasi, copot) + "Opsi lainnya" = menu shell.
+    let app = super::start_ctx::ctx_app(parsing, file_hit);
     let mut menu: Option<HMENU> = None;
-    if let Some(cm) = context_menu.as_ref() {
-        if let Ok(m) = unsafe { CreatePopupMenu() } {
-            menu = Some(m);
-            let qhr = unsafe { cm.QueryContextMenu(m, 0, 1, 0x7FFF, CMF_NORMAL | CMF_EXTENDEDVERBS) };
-            if qhr.is_ok() {
-                *ST_CONTEXT_MENU2.borrow_mut() = cm.cast::<IContextMenu2>().ok();
-                *ST_CONTEXT_MENU3.borrow_mut() = cm.cast::<IContextMenu3>().ok();
-                START_CONTEXT_MENU_OPEN.set(true);
-                let _ = unsafe { SetForegroundWindow(owner) };
-                let before = unsafe { GetForegroundWindow() };
-                let flags = TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0 | TPM_LEFTALIGN.0;
-                let command = unsafe { TrackPopupMenuEx(m, flags, pt.x, pt.y, owner, None) }.0 as u32;
-                let _ = unsafe { PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0)) };
-                START_CONTEXT_MENU_OPEN.set(false);
-                *ST_CONTEXT_MENU2.borrow_mut() = None;
-                *ST_CONTEXT_MENU3.borrow_mut() = None;
-
-                if command != 0 {
-                    let invoke = CMINVOKECOMMANDINFOEX {
-                        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                        // CMIC_MASK_UNICODE (0x4000) tidak ada di crate windows 0.61; nilainya dipakai langsung.
-                        fMask: CMIC_MASK_PTINVOKE | 0x0000_4000,
-                        hwnd: owner,
-                        lpVerb: PCSTR((command - 1) as usize as *const u8),
-                        lpVerbW: PCWSTR((command - 1) as usize as *const u16),
-                        nShow: SW_SHOWNORMAL.0,
-                        ptInvoke: pt,
-                        ..Default::default()
-                    };
-                    let _ = unsafe {
-                        cm.InvokeCommand(&invoke as *const CMINVOKECOMMANDINFOEX as *const CMINVOKECOMMANDINFO)
-                    };
-                    panel_close();
-                } else if before == owner
-                    && unsafe { GetForegroundWindow() } != owner
-                    && PANEL_OPEN.get() == PN_START
-                {
-                    panel_close();
+    if let Ok(m) = unsafe { CreatePopupMenu() } {
+        menu = Some(m);
+        let mut sv = super::start_ctx::ShellVerbs::default();
+        let mut sub: Option<HMENU> = None;
+        if let Some(cm) = context_menu.as_ref() {
+            if let Ok(sm) = unsafe { CreatePopupMenu() } {
+                if unsafe { cm.QueryContextMenu(sm, 0, 1, 0x7FFF, CMF_NORMAL | CMF_EXTENDEDVERBS) }.is_ok() {
+                    sv = super::start_ctx::scan_shell_menu(sm, cm);
+                    *ST_CONTEXT_MENU2.borrow_mut() = cm.cast::<IContextMenu2>().ok();
+                    *ST_CONTEXT_MENU3.borrow_mut() = cm.cast::<IContextMenu3>().ok();
                 }
+                sub = Some(sm);
             }
+        }
+        super::start_ctx::build_menu(m, &app, &sv, sub);
+        if let Some(sm) = sub {
+            // Submenu kosong tidak dipasang ke m, jadi dihancurkan sendiri.
+            if unsafe { GetMenuItemCount(Some(sm)) } <= 0 {
+                let _ = unsafe { DestroyMenu(sm) };
+            }
+        }
+        START_CONTEXT_MENU_OPEN.set(true);
+        let _ = unsafe { SetForegroundWindow(owner) };
+        let before = unsafe { GetForegroundWindow() };
+        let flags = TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0 | TPM_LEFTALIGN.0;
+        let command = unsafe { TrackPopupMenuEx(m, flags, pt.x, pt.y, owner, None) }.0 as u32;
+        let _ = unsafe { PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0)) };
+        START_CONTEXT_MENU_OPEN.set(false);
+        *ST_CONTEXT_MENU2.borrow_mut() = None;
+        *ST_CONTEXT_MENU3.borrow_mut() = None;
+
+        let mut invoke_shell = |id: u32| {
+            if let Some(cm) = context_menu.as_ref() {
+                let invoke = CMINVOKECOMMANDINFOEX {
+                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+                    // CMIC_MASK_UNICODE (0x4000) tidak ada di crate windows 0.61; nilainya dipakai langsung.
+                    fMask: CMIC_MASK_PTINVOKE | 0x0000_4000,
+                    hwnd: owner,
+                    lpVerb: PCSTR((id - 1) as usize as *const u8),
+                    lpVerbW: PCWSTR((id - 1) as usize as *const u16),
+                    nShow: SW_SHOWNORMAL.0,
+                    ptInvoke: pt,
+                    ..Default::default()
+                };
+                let _ = unsafe {
+                    cm.InvokeCommand(&invoke as *const CMINVOKECOMMANDINFOEX as *const CMINVOKECOMMANDINFO)
+                };
+            }
+        };
+        if command >= 0x9000 {
+            super::start_ctx::run(command, &app, parsing, &sv, &mut invoke_shell);
+        } else if command != 0 {
+            invoke_shell(command);
+            panel_close();
+        } else if before == owner && unsafe { GetForegroundWindow() } != owner && PANEL_OPEN.get() == PN_START {
+            panel_close();
         }
     }
 
@@ -1316,7 +1503,8 @@ pub fn st_hit_icon_with<R>(h: &StHit, px: i32, f: impl FnOnce(&mut Icon) -> R) -
                     if !e.icon_tried {
                         e.icon_tried = true;
                         let name = format!("shell:AppsFolder\\{}", e.id);
-                        e.icon.src = icon_from_parsing_name(&name, px);
+                        // Ikon dari exe di disk dulu (selalu terkini); bila tidak ada, jalur shell lama.
+                        e.icon.src = st_exe_icon(&e.exe, px).or_else(|| icon_from_parsing_name(&name, px));
                     }
                     return f(&mut e.icon);
                 }

@@ -33,15 +33,27 @@ const NI_PMTOG: i32 = 23;
 const NI_PRESET: i32 = 24; // 24..29
 const NI_PMGO: i32 = 30;
 const NI_PMSTOP: i32 = 31;
+const NI_PMADJ_DN: i32 = 32; // timer kustom: kurangi 5 menit
+const NI_PMADJ_UP: i32 = 33; // timer kustom: tambah 5 menit
+const NI_PMCUSTOM: i32 = 34; // timer kustom: mulai dengan durasi NT_PM_CUSTOM
 const NI_NOTE: i32 = 40;
 const NI_NOTEFILE: i32 = 41;
+const NI_SEEK: i32 = 42; // klik bar progres media: seek ke posisi
 const NI_NOTEROW: i32 = 50; // 50..54
 const NI_SYS: i32 = 60;
 const NI_NET: i32 = 61;
 const NI_BAT: i32 = 62;
 const NI_MUTE: i32 = 63;
 const NI_VOLTRK: i32 = 64;
+const NI_SYS_MEDIA: i32 = 65; // chip "Media" di kartu Sistem: aktif/nonaktifkan pulau media
+const NI_SYS_ALWAYS: i32 = 66; // chip "Auto-hide"/"Selalu tampil" di kartu Sistem: notchalways
+const NI_SYS_LYR: i32 = 67; // chip "Lirik" di panel Pengaturan notch: notchlyrics
+const NI_SYS_MEDTEMP: i32 = 68; // chip "Terus"/"Sementara" di panel Pengaturan notch: notchmedtemp
+const NI_SET: i32 = 94; // tombol roda gigi: buka/tutup panel Pengaturan notch
+const NI_SET_NOTIF: i32 = 95; // panel Pengaturan: buka pengaturan Notifikasi Windows
 const NI_BODY: i32 = 70;
+const NI_NOTIF: i32 = 71; // kartu notifikasi di HUD: buka aplikasinya
+const NI_NOTIF_ROW: i32 = 80; // 80..91: baris riwayat notifikasi di notch terbuka
 const NT_PRESETS: [i32; 6] = [5, 10, 15, 25, 45, 60];
 
 #[derive(Clone, Copy, Default)]
@@ -73,6 +85,8 @@ static NT_NO_HIT: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 static NT_BRI_INIT: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 static NT_PREV: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(NT_IDLE));
 static NT_TAB: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(NTT_HOME));
+// Panel Pengaturan notch (tombol roda gigi di baris tab); menggantikan isi tab saat terbuka.
+static NT_SET: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 static NT_FROM: SyncCell<Cell<NtGeo>> = SyncCell::new(Cell::new(NT_GEO_ZERO));
 static NT_TO: SyncCell<Cell<NtGeo>> = SyncCell::new(Cell::new(NT_GEO_ZERO));
 static NT_T0: SyncCell<Cell<i64>> = SyncCell::new(Cell::new(0));
@@ -113,6 +127,15 @@ static PM_STATE: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
 static PM_TOTAL: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(25 * 60));
 static PM_PAUSED: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
 static PM_END: SyncCell<Cell<u64>> = SyncCell::new(Cell::new(0));
+// Media dijeda: pulau tetap tampil paling lama NT_PAUSE_MS sejak jeda dimulai (GetTickCount64).
+static NT_PAUSE_T0: SyncCell<Cell<u64>> = SyncCell::new(Cell::new(0));
+const NT_PAUSE_MS: u64 = 5 * 60 * 1000;
+// Posisi X klik terakhir (koordinat jendela) untuk seek pada bar progres (NI_SEEK).
+static NT_CLICK_X: SyncCell<Cell<f32>> = SyncCell::new(Cell::new(0.0));
+// Garis bar progres yang terakhir digambar: kiri, kanan, dan y tengah (piksel jendela).
+static NT_TL_BAR: SyncCell<Cell<(f32, f32, f32)>> = SyncCell::new(Cell::new((0.0, 0.0, 0.0)));
+// Durasi timer kustom (menit), dibatasi 5..180 dan bisa diubah dengan tombol +/-.
+static NT_PM_CUSTOM: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(25));
 
 fn nt_tick64() -> u64 {
     // SAFETY: GetTickCount64 tanpa argumen dan tanpa prasyarat.
@@ -388,22 +411,16 @@ fn nt_filetime_now() -> i64 {
 fn nt_timeline(pos: &mut i32, dur: &mut i32) -> bool {
     *pos = 0;
     *dur = 0;
-    let sess = SESS.borrow();
-    let Some(s) = sess.as_ref() else {
-        return false;
+    // 2026-11-15: garis waktu dikirim pekerja GSMTC (media_worker.rs) ke MEDIA; tanpa panggilan WinRT di thread UI.
+    let (has, status, s0, e0, p0, u0) = {
+        let m = MEDIA.borrow();
+        (m.has, m.status, m.tl_start, m.tl_end, m.tl_pos, m.tl_upd)
     };
-    let Ok(tl) = s.GetTimelineProperties() else {
-        return false;
-    };
-    let s0 = tl.StartTime().map(|v| v.Duration).unwrap_or(0);
-    let e0 = tl.EndTime().map(|v| v.Duration).unwrap_or(0);
-    let p0 = tl.Position().map(|v| v.Duration).unwrap_or(0);
-    let u0 = tl.LastUpdatedTime().map(|v| v.UniversalTime).unwrap_or(0);
-    if e0 - s0 <= 10_000_000 {
+    if !has || e0 - s0 <= 10_000_000 {
         return false;
     }
     let mut ps = (p0 - s0) as f64 / 1e7;
-    if MEDIA.borrow().status == 4 && u0 > 0 {
+    if status == 4 && u0 > 0 {
         let el = (nt_filetime_now() - u0) as f64 / 1e7;
         if el > 0.0 && el < 6.0 * 3600.0 {
             ps += el;
@@ -425,14 +442,65 @@ fn nt_has_media() -> bool {
     m.has && (m.title[0] != 0 || m.artist[0] != 0)
 }
 
-// Media sedang diputar (status 4) dan fitur pulau media aktif.
-fn nt_live_on() -> bool {
-    NOTCH_HUD.get() && NOTCH_LIVE.get() && MEDIA.borrow().status == 4 && nt_has_media()
+// Posisi putar dalam ms, diekstrapolasi seperti nt_timeline (dipakai lirik).
+fn nt_pos_ms() -> i64 {
+    let (has, status, s0, p0, u0) = {
+        let m = MEDIA.borrow();
+        (m.has, m.status, m.tl_start, m.tl_pos, m.tl_upd)
+    };
+    if !has {
+        return 0;
+    }
+    let mut ps = (p0 - s0) as f64 / 1e7;
+    if status == 4 && u0 > 0 {
+        let el = (nt_filetime_now() - u0) as f64 / 1e7;
+        if el > 0.0 && el < 6.0 * 3600.0 {
+            ps += el;
+        }
+    }
+    (ps * 1000.0).max(0.0) as i64
 }
 
-// Pulau ringkas menetap: media diputar dan tidak sedang diperluas hover atau intip.
+// Lirik untuk posisi sekarang (lyrics.rs). None bila lirik dimatikan, tanpa media, atau belum tersedia.
+fn nt_lyric_line() -> Option<String> {
+    if !NOTCH_LYRICS.get() || !nt_has_media() {
+        return None;
+    }
+    let k = super::lyrics::key(&nt_wstr(&MEDIA.borrow().artist), &nt_wstr(&MEDIA.borrow().title));
+    super::lyrics::line(&k, nt_pos_ms()).filter(|l| !l.trim().is_empty())
+}
+
+// Minta lirik untuk lagu di MEDIA; non-blokir (pencarian di thread latar, lihat lyrics.rs).
+fn nt_lyr_want() {
+    let (a, t, d) = {
+        let m = MEDIA.borrow();
+        (nt_wstr(&m.artist), nt_wstr(&m.title), (m.tl_end - m.tl_start) / 10_000_000)
+    };
+    super::lyrics::want(&a, &t, d as i32);
+}
+
+/// Garis diam selalu terlihat (notchalways=1), kecuali di atas video/game layar penuh.
+fn nt_always() -> bool {
+    NOTCH_ALWAYS.get() && NT_FS_MODE.get() == 0
+}
+
+// Media sedang diputar (status 4), atau dijeda (status 5) selama belum melewati NT_PAUSE_MS.
+// Layar penuh "hanya notifikasi": pulau media tidak muncul sama sekali.
+fn nt_live_on() -> bool {
+    if nt_fs_quiet() || !(NOTCH_HUD.get() && NOTCH_LIVE.get() && nt_has_media()) {
+        return false;
+    }
+    match MEDIA.borrow().status {
+        4 => true,
+        5 => nt_tick64().wrapping_sub(NT_PAUSE_T0.get()) < NT_PAUSE_MS,
+        _ => false,
+    }
+}
+
+// Pulau ringkas menetap (hanya bila notchcompact=1): media diputar dan tidak sedang diperluas hover atau intip.
+// Default: pulau media penuh (judul, artis, kontrol) selama ada media, lewat cabang non-ringkas di nt_target.
 fn nt_compact() -> bool {
-    nt_live_on() && !NT_HOVER_PEEK.get() && !NT_FULL.get()
+    NOTCH_COMPACT.get() && nt_live_on() && !NT_HOVER_PEEK.get() && !NT_FULL.get()
 }
 
 // Keadaan yang boleh menerima hover untuk memperluas pulau (diam, atau ringkas tanpa hover).
@@ -451,11 +519,11 @@ fn nt_target(st: i32) -> NtGeo {
     let mut g = NtGeo { w: 0.0, h: 0.0, rad: 0.0, e: 0.0, a: 1.0 };
     match st {
         NT_IDLE => {
-            // tersembunyi: garis tipis yang memudar
+            // tersembunyi: garis tipis yang memudar; notchalways=1: garis tetap terlihat
             g.w = sf(160.0);
             g.h = sf(10.0);
             g.rad = sf(5.0);
-            g.a = 0.0;
+            g.a = if nt_always() { 1.0 } else { 0.0 };
         }
         NT_PEEK => {
             if nt_compact() {
@@ -478,7 +546,11 @@ fn nt_target(st: i32) -> NtGeo {
             g.h = sf(44.0);
             g.rad = sf(22.0);
             g.w = sf(300.0);
-            if NT_HUD_KIND.get() == HUD_MSG {
+            if NT_HUD_KIND.get() == HUD_NOTIF {
+                g.w = sf(420.0);
+                g.h = sf(66.0);
+                g.rad = sf(26.0);
+            } else if NT_HUD_KIND.get() == HUD_MSG {
                 let txt = nt_msg_string();
                 let tf = TF_S.borrow();
                 let f: Option<&IDWriteTextFormat> = tf.as_ref();
@@ -541,6 +613,8 @@ fn nt_go(st: i32) {
     NT_FROM.set(nt_cur());
     NT_PREV.set(NT_STATE.get());
     NT_STATE.set(st);
+    // bar progres dan lirik hanya terlihat di intip/terbuka: hanya saat itu event garis waktu diproses segera
+    super::media_worker::set_tl_hot(st == NT_PEEK || st == NT_OPEN);
     let to = nt_target(st);
     NT_TO.set(to);
     let from = NT_FROM.get();
@@ -584,6 +658,25 @@ fn nt_go(st: i32) {
     }
 }
 
+// Terapkan notchalways pada keadaan diam: tampil (animasi ke garis terlihat) atau sembunyi (memudar, lalu nt_tick menyembunyikan).
+// Keadaan lain (intip, HUD, terbuka) sudah menampilkan jendela dan akan mengikuti aturan ini saat kembali diam.
+fn nt_idle_apply() {
+    let h = NT_WND.get();
+    if h.0.is_null() || !NT_SHOWN.get() || NT_STATE.get() != NT_IDLE {
+        return;
+    }
+    if nt_always() {
+        // SAFETY: h adalah jendela notch yang valid.
+        unsafe {
+            if !IsWindowVisible(h).as_bool() {
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
+    nt_go(NT_IDLE);
+}
+
 fn nt_tick() {
     let mut now: i64 = 0;
     let mut fq: i64 = 0;
@@ -602,7 +695,7 @@ fn nt_tick() {
         if done {
             let _ = KillTimer(Some(wnd), 1);
         }
-        if done && NT_STATE.get() == NT_IDLE {
+        if done && NT_STATE.get() == NT_IDLE && !nt_always() {
             // tersembunyi penuh: tidak ada jendela, tidak ada gambar
             let _ = ShowWindow(wnd, SW_HIDE);
         } else {
@@ -931,6 +1024,10 @@ fn nt_mmss(s: i32) -> String {
 
 // Baris sumber media: "artis · sumber" bila keduanya ada, selain itu salah satunya (w12notch.inc:502-508).
 fn nt_media_sub() -> String {
+    // lirik tersinkron menggantikan baris artis selama ada baris untuk posisi sekarang
+    if let Some(l) = nt_lyric_line() {
+        return copy_wide(&l, 300);
+    }
     let artist = nt_wstr(&MEDIA.borrow().artist);
     let src = media_source_name(64);
     let s = if !artist.is_empty() && !src.is_empty() {
@@ -941,6 +1038,59 @@ fn nt_media_sub() -> String {
         src
     };
     copy_wide(&s, 300)
+}
+
+thread_local! {
+    // Cache potongan teks terakhir (teks, lebar, hasil) agar tidak mengukur ulang setiap gambar.
+    static NT_FIT_CACHE: std::cell::RefCell<(String, i32, String)> =
+        std::cell::RefCell::new((String::new(), -1, String::new()));
+}
+
+// Potong `s` agar muat di `maxw` dengan elipsis di akhir. Teks yang sudah muat dikembalikan apa adanya.
+fn nt_fit(s: &str, f: Option<&IDWriteTextFormat>, maxw: f32) -> String {
+    if s.is_empty() || measure_text(s, f) <= maxw {
+        return s.to_string();
+    }
+    let key_w = maxw.floor() as i32;
+    let hit = NT_FIT_CACHE.with(|c| {
+        let c = c.borrow();
+        if c.0 == s && c.1 == key_w { Some(c.2.clone()) } else { None }
+    });
+    if let Some(v) = hit {
+        return v;
+    }
+    // Pencarian biner panjang awalan terpanjang yang muat bersama elipsis.
+    let chars: Vec<char> = s.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let cand: String = chars[..mid].iter().collect::<String>() + "\u{2026}";
+        if measure_text(&cand, f) <= maxw {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let out: String = chars[..lo].iter().collect::<String>() + "\u{2026}";
+    NT_FIT_CACHE.with(|c| *c.borrow_mut() = (s.to_string(), key_w, out.clone()));
+    out
+}
+
+// Bar progres tipis dan samar di tepi bawah pil, hanya saat lirik tampil. Tidak menggeser teks.
+fn nt_lyr_progress(l: f32, r: f32, h: f32) {
+    let mut pos = 0i32;
+    let mut dur = 0i32;
+    if r <= l || !nt_timeline(&mut pos, &mut dur) || dur <= 0 {
+        return;
+    }
+    let p = *PALETTE.borrow();
+    let th = sf(2.0);
+    let cy = h - sf(3.0);
+    let frac = (pos as f32 / dur as f32).clamp(0.0, 1.0);
+    fill_rr(l, cy - th * 0.5, r, cy + th * 0.5, th * 0.5, p.track, 0.35);
+    if frac > 0.005 {
+        fill_rr(l, cy - th * 0.5, l + (r - l) * frac, cy + th * 0.5, th * 0.5, p.sub, 0.7);
+    }
 }
 
 // Glyph jaringan; NET_BOTH ditampilkan sebagai kabel (w12notch.inc:510-511).
@@ -1090,11 +1240,19 @@ fn nt_draw_peek(w: f32, h: f32) {
     draw_art(ax, cy - art / 2.0, art);
     let bx = w - sf(8.0) - sf(30.0) * 3.0 - sf(4.0) * 2.0;
     let tx = ax + art + sf(10.0);
+    let lyr_on = nt_lyric_line().is_some();
     let sub = nt_media_sub();
-    let sub_show = if sub.is_empty() { " " } else { sub.as_str() };
+    let sub_show = {
+        let fx = TF_XS.borrow();
+        let fitted = nt_fit(&sub, fx.as_ref(), bx - sf(8.0) - tx);
+        if fitted.is_empty() { " ".to_string() } else { fitted }
+    };
     let title = nt_wstr(&MEDIA.borrow().title);
     text(&title, TF_SS.borrow().as_ref(), tx, cy - sf(17.0), bx - sf(8.0), cy, p.text, 1.0);
-    text(sub_show, TF_XS.borrow().as_ref(), tx, cy, bx - sf(8.0), cy + sf(16.0), p.sub, 1.0);
+    text(&sub_show, TF_XS.borrow().as_ref(), tx, cy, bx - sf(8.0), cy + sf(16.0), p.sub, 1.0);
+    if lyr_on {
+        nt_lyr_progress(tx, bx - sf(8.0), h);
+    }
     for i in 0..3i32 {
         let cx = bx + sf(15.0) + i as f32 * sf(34.0);
         let fill = if i == 1 { Some(p.chip_hover) } else { None };
@@ -1112,10 +1270,17 @@ fn nt_draw_peek(w: f32, h: f32) {
     }
 }
 
+// Nilai NT_MSG_GLYPH untuk pesan pengisi daya tersambung (bukan kode glyph sungguhan).
+const NT_GLYPH_CHG: u16 = 0xFFFF;
+
 fn nt_draw_hud(w: f32, h: f32) {
     let p = *PALETTE.borrow();
     let cy = h * 0.5;
     let hud = NT_HUD_KIND.get();
+    if hud == HUD_NOTIF {
+        nt_draw_notif(w, h);
+        return;
+    }
     if hud == HUD_MSG {
         let msg = nt_msg_string();
         if NT_MSG_WARN.get() {
@@ -1125,9 +1290,16 @@ fn nt_draw_hud(w: f32, h: f32) {
             text(&msg, TF_S.borrow().as_ref(), sf(46.0), 0.0, w - sf(16.0), h, warn, 1.0);
             return;
         }
+        if NT_MSG_GLYPH.get() == NT_GLYPH_CHG {
+            // pengisi daya tersambung: ikon baterai berwarna aksen (glyph font tampil blok di Windows ini)
+            draw_battery(sf(26.0), cy, sf(17.0), p.accent, p.veil);
+            text(&msg, TF_S.borrow().as_ref(), sf(46.0), 0.0, w - sf(16.0), h, p.text, 1.0);
+            return;
+        }
         let gl = NT_MSG_GLYPH.get();
         let g = if gl != 0 { gl } else { 0xE916 };
-        glyph(g, TF_GLYPH.borrow().as_ref(), sf(26.0), cy, sf(10.0), p.accent_ink, 1.0);
+        let gc = if NT_ALERT_RED.get() { rgba(232, 72, 85, 1.0) } else { p.accent_ink };
+        glyph(g, TF_GLYPH.borrow().as_ref(), sf(26.0), cy, sf(10.0), gc, 1.0);
         text(&msg, TF_S.borrow().as_ref(), sf(46.0), 0.0, w - sf(16.0), h, p.text, 1.0);
         return;
     }
@@ -1162,10 +1334,14 @@ fn nt_home_media(l: f32, t: f32, r: f32, b: f32) {
     draw_art(l + pad, t + pad, art);
     let tx = l + pad + art + sf(10.0);
     let sub = nt_media_sub();
-    let sub_show = if sub.is_empty() { " " } else { sub.as_str() };
+    let sub_show = {
+        let fx = TF_XS.borrow();
+        let fitted = nt_fit(&sub, fx.as_ref(), r - pad - tx);
+        if fitted.is_empty() { " ".to_string() } else { fitted }
+    };
     let title = nt_wstr(&MEDIA.borrow().title);
     text(&title, TF_SS.borrow().as_ref(), tx, t + pad + sf(12.0), r - pad, t + pad + sf(32.0), p.text, 1.0);
-    text(sub_show, TF_XS.borrow().as_ref(), tx, t + pad + sf(32.0), r - pad, t + pad + sf(50.0), p.sub, 1.0);
+    text(&sub_show, TF_XS.borrow().as_ref(), tx, t + pad + sf(32.0), r - pad, t + pad + sf(50.0), p.sub, 1.0);
     // garis waktu: posisi dan durasi (detik)
     let (mut pos, mut dur) = (0i32, 0i32);
     if nt_timeline(&mut pos, &mut dur) {
@@ -1175,7 +1351,11 @@ fn nt_home_media(l: f32, t: f32, r: f32, b: f32) {
         let z = nt_mmss(dur);
         text(&a, TF_XS.borrow().as_ref(), l + pad, py - sf(9.0), l + pad + lw, py + sf(9.0), p.sub, 1.0);
         nt_text_r(&z, TF_XS.borrow().as_ref(), r - pad, py - sf(9.0), py + sf(9.0), p.sub);
-        nt_bar(l + pad + lw + sf(2.0), py, r - pad - lw - sf(2.0), sf(3.0), pos as f32 / dur as f32, p.text);
+        let (bl, br) = (l + pad + lw + sf(2.0), r - pad - lw - sf(2.0));
+        nt_bar(bl, py, br, sf(3.0), pos as f32 / dur as f32, p.text);
+        // bar progres bisa diklik untuk seek; geometri dicatat untuk perhitungan fraksi di nt_act
+        NT_TL_BAR.set((bl, br, py));
+        nt_hit(bl, py - sf(8.0), br, py + sf(8.0), NI_SEEK);
     }
     let cy = b - pad - sf(20.0);
     for i in 0..3i32 {
@@ -1268,6 +1448,11 @@ fn nt_home_sys(l: f32, t: f32, r: f32, b: f32) {
     };
     let foot = if bat && CHARGING.get() { format!("{} \u{00B7} adaptor tersambung", nt) } else { nt.to_string() };
     text(&foot, TF_XS.borrow().as_ref(), l + pad, b - pad - sf(18.0), r - pad, b - pad, p.sub, 1.0);
+    // chip "Media": pulau media langsung (NOTCH_LIVE); didaftarkan setelah area kartu agar klik chip diutamakan
+    nt_chip(r - pad - sf(64.0), t + sf(8.0), r - pad, t + sf(30.0), "Media", NI_SYS_MEDIA, NOTCH_LIVE.get());
+    // chip mode notch: aktif = selalu tampil (garis tetap di tepi atas), nonaktif = auto-hide
+    let al = if NOTCH_ALWAYS.get() { "Selalu tampil" } else { "Auto-hide" };
+    nt_chip(r - pad - sf(170.0), t + sf(8.0), r - pad - sf(70.0), t + sf(30.0), al, NI_SYS_ALWAYS, NOTCH_ALWAYS.get());
 }
 
 // Tab pengatur waktu: cincin besar, sisa waktu, durasi, dan tombol Mulai/Hentikan (NtTimerTab, w12notch.inc:717-749).
@@ -1297,6 +1482,17 @@ fn nt_timer_tab(l: f32, t: f32, r: f32, b: f32) {
     let x0 = l + sf(196.0);
     let x1 = r - pad;
     text("Durasi", TF_SS.borrow().as_ref(), x0, t + pad, x1, t + pad + sf(18.0), p.sub, 1.0);
+    // durasi kustom di kanan baris "Durasi": [-] [N m] [+]; chip tengah memulai timer dengan durasi itu
+    let up_l = x1 - sf(30.0);
+    let mid_r = up_l - sf(6.0);
+    let mid_l = mid_r - sf(56.0);
+    let dn_r = mid_l - sf(6.0);
+    let dn_l = dn_r - sf(30.0);
+    let cm = NT_PM_CUSTOM.get();
+    let cm_on = pm != 0 && PM_TOTAL.get() == cm * 60;
+    nt_chip(dn_l, t + sf(8.0), dn_r, t + sf(38.0), "-", NI_PMADJ_DN, false);
+    nt_chip(mid_l, t + sf(8.0), mid_r, t + sf(38.0), &format!("{} m", cm), NI_PMCUSTOM, cm_on);
+    nt_chip(up_l, t + sf(8.0), x1, t + sf(38.0), "+", NI_PMADJ_UP, false);
     let cw = (x1 - x0 - 5.0 * sf(8.0)) / 6.0;
     for i in 0..6usize {
         let s = format!("{} m", NT_PRESETS[i]);
@@ -1404,16 +1600,194 @@ fn nt_note_row(l: f32, t: f32, r: f32, b: f32) {
 }
 
 // Kartu terbuka: bilah tab, jam/tanggal, gugus status, isi tab, lalu baris catatan (w12notch.inc:798-828)
+// ---------------------------------------------------------------- Pengaturan notch (2026-11-19)
+// Gaya Pengaturan Windows 11: navigasi bagian di kiri, baris (judul + keterangan) dengan sakelar atau kontrol segmen
+// di kanan. Id lama (NI_SYS_*) tetap dipakai agar penanganan klik kartu Sistem tidak berubah.
+const NI_ST_SEC: i32 = 100; // 100..103: navigasi bagian
+const NI_ST_HUD: i32 = 104; // notchhud: volume, kecerahan, baterai, pesan status
+const NI_ST_NOTIF: i32 = 105; // notchnotif: notifikasi aplikasi lewat notch
+const NI_ST_ONLY: i32 = 106; // notchonly: sembunyikan banner Windows
+const NI_ST_FSV: i32 = 110; // 110..112: notchfsvideo 0/1/2
+const NI_ST_FSG: i32 = 113; // 113..115: notchfsgame 0/1/2
+static NT_SET_SEC: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
+// Salinan notchnotif / notchonly (-1 = belum dibaca) agar render tidak membaca settings.ini tiap frame.
+static NT_CFG_NOTIF: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(-1));
+static NT_CFG_ONLY: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(-1));
+
+fn nt_ini_flag(c: &SyncCell<Cell<i32>>, key: &str) -> bool {
+    if c.get() < 0 {
+        c.set(if ini_int("shell", key, 1) != 0 { 1 } else { 0 });
+    }
+    c.get() != 0
+}
+
+fn nt_ini_toggle(c: &SyncCell<Cell<i32>>, key: &str) {
+    let on = !nt_ini_flag(c, key);
+    c.set(on as i32);
+    let _ = ini_write("shell", key, if on { "1" } else { "0" });
+    super::notif_worker::apply_settings();
+}
+
+/// Sakelar Windows 11 (40x20): nyala = isi aksen + kenop putih di kanan; mati = garis tepi + kenop di kiri.
+fn nt_switch(r: f32, cy: f32, on: bool, id: i32) {
+    let p = *PALETTE.borrow();
+    let (w, h) = (sf(40.0), sf(20.0));
+    let (l, t) = (r - w, cy - h * 0.5);
+    nt_hit(l - sf(6.0), t - sf(6.0), r + sf(4.0), t + h + sf(6.0), id);
+    let hov = !NT_NO_HIT.get() && NT_HOV.get() == id;
+    let down = !NT_NO_HIT.get() && NT_DOWN.get() == id;
+    let kr = if down { sf(7.0) } else if hov { sf(6.0) } else { sf(5.0) };
+    if on {
+        fill_rr(l, t, r, t + h, h * 0.5, p.accent, if hov { 0.9 } else { 1.0 });
+        fill_rr(r - h * 0.5 - kr, cy - kr, r - h * 0.5 + kr, cy + kr, kr, rgba(255, 255, 255, 1.0), 1.0);
+    } else {
+        let fill = if hov { p.hover } else { p.chip };
+        bt_card(l, t, r, t + h, h * 0.5, &fill, &p.sub, 1.0);
+        fill_rr(l + h * 0.5 - kr, cy - kr, l + h * 0.5 + kr, cy + kr, kr, p.sub, 1.0);
+    }
+}
+
+/// Kontrol segmen (pilihan tunggal); `sel` = indeks terpilih, id = id0 + indeks.
+fn nt_segment(l: f32, t: f32, r: f32, b: f32, labels: &[&str], sel: usize, id0: i32) {
+    let p = *PALETTE.borrow();
+    let rad = sf(6.0);
+    bt_card(l, t, r, b, rad, &p.chip_hover, &p.line, 1.0);
+    let n = labels.len().max(1) as f32;
+    let sw = (r - l) / n;
+    for (i, s) in labels.iter().enumerate() {
+        let sl = l + sw * i as f32;
+        let id = id0 + i as i32;
+        if i == sel {
+            bt_card(sl + sf(2.0), t + sf(2.0), sl + sw - sf(2.0), b - sf(2.0), rad - sf(1.0), &p.chip, &p.line, 1.0);
+            // garis aksen kecil di bawah pilihan, seperti pemilih segmen Windows 11
+            let cx = sl + sw * 0.5;
+            fill_rr(cx - sf(8.0), b - sf(5.0), cx + sf(8.0), b - sf(3.0), sf(1.0), p.accent, 1.0);
+            nt_hit(sl, t, sl + sw, b, id);
+        } else {
+            nt_hover(sl + sf(2.0), t + sf(2.0), sl + sw - sf(2.0), b - sf(2.0), rad - sf(1.0), id);
+        }
+        let c = if i == sel { p.text } else { p.sub };
+        wf_text_c(s, TF_XS.borrow().as_ref(), sl + sw * 0.5, t, b - sf(2.0), &c);
+    }
+}
+
+/// Satu baris pengaturan: judul + keterangan di kiri (sampai `tr`), kontrol digambar pemanggil di kanan.
+fn nt_set_row(l: f32, t: f32, tr: f32, h: f32, title: &str, desc: &str) {
+    let p = *PALETTE.borrow();
+    if desc.is_empty() {
+        text(title, TF_SS.borrow().as_ref(), l, t, tr, t + h, p.text, 1.0);
+    } else {
+        let m = (h - sf(34.0)).max(0.0) * 0.5;
+        text(title, TF_SS.borrow().as_ref(), l, t + m, tr, t + m + sf(18.0), p.text, 1.0);
+        text(desc, TF_XS.borrow().as_ref(), l, t + m + sf(17.0), tr, t + m + sf(34.0), p.sub, 1.0);
+    }
+}
+
+fn nt_settings_tab(l: f32, t: f32, r: f32, b: f32) {
+    let p = *PALETTE.borrow();
+    nt_card(l, t, r, b);
+    // navigasi bagian (kiri)
+    const SL: [&str; 4] = ["Tampilan", "Media", "Notifikasi", "Layar penuh"];
+    const SG: [u16; 4] = [0xE790, 0xE8D6, 0xEA8F, 0xE740];
+    let sec = NT_SET_SEC.get().clamp(0, 3);
+    let nl = l + sf(8.0);
+    let nr = l + sf(148.0);
+    let ih = sf(36.0);
+    let mut y = t + sf(8.0);
+    for i in 0..4usize {
+        let on = sec == i as i32;
+        let id = NI_ST_SEC + i as i32;
+        if on {
+            fill_rr(nl, y, nr, y + ih, sf(8.0), p.chip_hover, 1.0);
+            // indikator aksen vertikal di kiri, seperti navigasi Pengaturan Windows 11
+            fill_rr(nl, y + sf(10.0), nl + sf(3.0), y + ih - sf(10.0), sf(1.5), p.accent, 1.0);
+            nt_hit(nl, y, nr, y + ih, id);
+        } else {
+            nt_hover(nl, y, nr, y + ih, sf(8.0), id);
+        }
+        let c = if on { p.text } else { p.sub };
+        glyph(SG[i], TF_GLYPH_SM.borrow().as_ref(), nl + sf(20.0), y + ih * 0.5, sf(8.0), c, 1.0);
+        let f = if on { TF_SS.borrow() } else { TF_S.borrow() };
+        text(SL[i], f.as_ref(), nl + sf(36.0), y, nr - sf(4.0), y + ih, c, 1.0);
+        y += ih + sf(4.0);
+    }
+    fill_rr(nr + sf(8.0), t + sf(12.0), nr + sf(9.0), b - sf(12.0), 0.0, p.line, 1.0);
+    // isi bagian (kanan)
+    let cl = nr + sf(22.0);
+    let cr = r - sf(16.0);
+    text(SL[sec as usize], TF_S.borrow().as_ref(), cl, t + sf(8.0), cr, t + sf(32.0), p.text, 1.0);
+    let rh = sf(46.0);
+    let mut y = t + sf(36.0);
+    let sw_r = cr; // sakelar rata kanan
+    let tr = cr - sf(56.0);
+    let row_sep = |y: f32| fill_rr(cl, y, cr, y + sf(1.0), 0.0, p.line, 1.0);
+    match sec {
+        0 => {
+            nt_set_row(cl, y, tr, rh, "Selalu tampilkan garis notch", "Mati: muncul saat kursor di tepi atas tengah");
+            nt_switch(sw_r, y + rh * 0.5, NOTCH_ALWAYS.get(), NI_SYS_ALWAYS);
+            y += rh;
+            row_sep(y);
+            nt_set_row(cl, y, tr, rh, "Status sistem di notch", "Volume, kecerahan, baterai, dan pengisi daya");
+            nt_switch(sw_r, y + rh * 0.5, NOTCH_HUD.get(), NI_ST_HUD);
+        }
+        1 => {
+            nt_set_row(cl, y, tr, rh, "Pulau media", "Sampul, judul, dan kontrol saat musik diputar");
+            nt_switch(sw_r, y + rh * 0.5, NOTCH_LIVE.get(), NI_SYS_MEDIA);
+            y += rh;
+            row_sep(y);
+            nt_set_row(cl, y, tr, rh, "Hanya muncul sebentar", "Intip 3 detik saat lagu berganti atau dijeda");
+            nt_switch(sw_r, y + rh * 0.5, NOTCH_MEDIA_TEMP.get(), NI_SYS_MEDTEMP);
+            y += rh;
+            row_sep(y);
+            nt_set_row(cl, y, tr, rh, "Lirik lagu", "Baris lirik tersinkron dari LRCLIB");
+            nt_switch(sw_r, y + rh * 0.5, NOTCH_LYRICS.get(), NI_SYS_LYR);
+        }
+        2 => {
+            let on = nt_ini_flag(&NT_CFG_NOTIF, "notchnotif");
+            nt_set_row(cl, y, tr, rh, "Notifikasi lewat notch", "Kartu notifikasi aplikasi muncul di pulau");
+            nt_switch(sw_r, y + rh * 0.5, on, NI_ST_NOTIF);
+            y += rh;
+            row_sep(y);
+            let only = on && nt_ini_flag(&NT_CFG_ONLY, "notchonly");
+            nt_set_row(cl, y, tr, rh, "Sembunyikan banner Windows", "Alarm dan panggilan tetap memakai banner");
+            nt_switch(sw_r, y + rh * 0.5, only, NI_ST_ONLY);
+            y += rh;
+            row_sep(y);
+            nt_set_row(cl, y, cr - sf(150.0), rh, "Notifikasi per aplikasi", "Atur di Pengaturan Windows");
+            nt_button(cr - sf(140.0), y + rh * 0.5 - sf(13.0), cr, y + rh * 0.5 + sf(13.0), "Buka Pengaturan", NI_SET_NOTIF, false);
+        }
+        _ => {
+            const OPT: [&str; 3] = ["Sembunyi", "Notifikasi", "+ Media"];
+            let segl = cr - sf(228.0);
+            let tr = segl - sf(10.0);
+            let fs_now = super::state::FS_KIND.get();
+            let dv = if fs_now == 1 { "Peramban, YouTube, pemutar \u{00B7} aktif" } else { "Peramban, YouTube, pemutar" };
+            nt_set_row(cl, y, tr, rh, "Video layar penuh", dv);
+            let sv = super::state::NOTCH_FS_VIDEO.get().min(2) as usize;
+            nt_segment(segl, y + rh * 0.5 - sf(14.0), cr, y + rh * 0.5 + sf(14.0), &OPT, sv, NI_ST_FSV);
+            y += rh;
+            row_sep(y);
+            let dg = if fs_now == 2 { "Game dan aplikasi lain \u{00B7} aktif" } else { "Game dan aplikasi lain" };
+            nt_set_row(cl, y, tr, rh, "Game layar penuh", dg);
+            let sg = super::state::NOTCH_FS_GAME.get().min(2) as usize;
+            nt_segment(segl, y + rh * 0.5 - sf(14.0), cr, y + rh * 0.5 + sf(14.0), &OPT, sg, NI_ST_FSG);
+            y += rh;
+            let note = "+ Media: juga intip lagu dan buka notch dari tepi atas.";
+            text(note, TF_XS.borrow().as_ref(), cl, y + sf(6.0), cr, b - sf(6.0), p.sub, 1.0);
+        }
+    }
+}
+
 fn nt_draw_open(w: f32, h: f32) {
     let p = *PALETTE.borrow();
     let pad = sf(12.0);
     let t0 = pad;
     let t1 = pad + sf(30.0);
-    const TL: [&str; 3] = ["Beranda", "Timer", "Catatan"];
-    const TG: [u16; 3] = [0xE80F, 0xE916, 0xE70B];
+    const TL: [&str; 4] = ["Beranda", "Timer", "Catatan", "Notifikasi"];
+    const TG: [u16; 4] = [0xE80F, 0xE916, 0xE70B, 0xEA8F];
     let tab = NT_TAB.get();
     let mut x = pad;
-    for i in 0..3usize {
+    for i in 0..4usize {
         let on = tab == i as i32;
         let fb = if on { TF_SS.borrow() } else { TF_S.borrow() };
         let f = fb.as_ref();
@@ -1427,6 +1801,15 @@ fn nt_draw_open(w: f32, h: f32) {
         text(TL[i], f, x + sf(34.0), t0, x + tw, t1, c, 1.0);
         x += tw + sf(6.0);
     }
+    // tombol roda gigi: membuka/menutup panel Pengaturan notch
+    let gs = sf(30.0);
+    let on_set = NT_SET.get();
+    if on_set {
+        fill_rr(x, t0, x + gs, t1, sf(15.0), p.chip_hover, 1.0);
+    }
+    nt_hover(x, t0, x + gs, t1, sf(15.0), NI_SET);
+    glyph(0xE713, TF_GLYPH_SM.borrow().as_ref(), x + gs * 0.5, (t0 + t1) * 0.5, sf(8.0), if on_set { p.text } else { p.sub }, 1.0);
+    x += gs + sf(6.0);
     let ds = DATE_SHORT.borrow().clone();
     let tz = TIME_TZ.borrow().clone();
     let dw = measure_text(&ds, TF_S.borrow().as_ref());
@@ -1440,7 +1823,9 @@ fn nt_draw_open(w: f32, h: f32) {
     }
     let b0 = t1 + sf(10.0);
     let b1 = h - pad - sf(34.0) - sf(10.0);
-    if tab == NTT_HOME {
+    if NT_SET.get() {
+        nt_settings_tab(pad, b0, w - pad, b1);
+    } else if tab == NTT_HOME {
         let gap = sf(10.0);
         let avail = w - 2.0 * pad - 2.0 * gap;
         let w1 = avail * 1.35 / 3.35;
@@ -1450,6 +1835,8 @@ fn nt_draw_open(w: f32, h: f32) {
         nt_home_sys(pad + w1 + 2.0 * gap + w2, b0, w - pad, b1);
     } else if tab == NTT_TIMER {
         nt_timer_tab(pad, b0, w - pad, b1);
+    } else if tab == NTT_NOTIF {
+        nt_notif_tab(pad, b0, w - pad, b1);
     } else {
         nt_notes_tab(pad, b0, w - pad, b1);
     }
@@ -1683,6 +2070,31 @@ fn nt_inval() {
 // Klik pada elemen notch: buka, media, tab, timer, catatan, jaringan/baterai, dan lain-lain (w12notch.inc:951-993).
 fn nt_act(id: i32) {
     let st = NT_STATE.get();
+    if id == NI_NOTIF {
+        let cur = NT_NOTIF_CUR.borrow().clone();
+        NT_NOTIF_Q.borrow_mut().clear();
+        if let Some(n) = cur {
+            nt_open_notif_app(&n);
+        }
+        return;
+    }
+    if id == NI_NOTIF_CLEAR {
+        NT_NOTIF_RECENT.borrow_mut().clear();
+        nt_inval();
+        return;
+    }
+    if id == NI_NOTIF_CENTER {
+        nt_close(false);
+        shell_open("ms-actioncenter:");
+        return;
+    }
+    if (NI_NOTIF_ROW..NI_NOTIF_ROW + 12).contains(&id) {
+        let n = NT_NOTIF_RECENT.borrow().get((id - NI_NOTIF_ROW) as usize).cloned();
+        if let Some(n) = n {
+            nt_open_notif_app(&n);
+        }
+        return;
+    }
     if id == NI_BODY || (id == NI_MEDIA && st != NT_OPEN) {
         if st != NT_OPEN {
             nt_open(if st == NT_HUD && NT_HUD_KIND.get() == HUD_MSG { NTT_TIMER } else { NTT_HOME });
@@ -1698,6 +2110,101 @@ fn nt_act(id: i32) {
         media_cmd(id - NI_PREV, "notch");
         return;
     }
+    if id == NI_SEEK {
+        // fraksi dihitung dari posisi klik terhadap garis bar yang terakhir digambar (ruang gambar: NT_OX)
+        let (bl, br, _) = NT_TL_BAR.get();
+        if br > bl {
+            media_seek((NT_CLICK_X.get() - NT_OX.get() - bl) / (br - bl));
+        }
+        nt_inval();
+        return;
+    }
+    if id == NI_SYS_MEDIA {
+        // chip "Media" di kartu Sistem: menyalakan atau mematikan pulau media, disimpan ke ini
+        let on = !NOTCH_LIVE.get();
+        NOTCH_LIVE.set(on);
+        let _ = ini_write("shell", "notchlive", if on { "1" } else { "0" });
+        nt_live_sync();
+        nt_inval();
+        return;
+    }
+    if id == NI_SYS_LYR {
+        // chip "Lirik": disimpan ke [shell] notchlyrics; saat diaktifkan, lirik lagu aktif diminta
+        let on = !NOTCH_LYRICS.get();
+        NOTCH_LYRICS.set(on);
+        let _ = ini_write("shell", "notchlyrics", if on { "1" } else { "0" });
+        if on {
+            nt_lyr_want();
+        }
+        nt_inval();
+        return;
+    }
+    if id == NI_SYS_MEDTEMP {
+        // chip "Terus"/"Sementara": disimpan ke [shell] notchmedtemp
+        let on = !NOTCH_MEDIA_TEMP.get();
+        NOTCH_MEDIA_TEMP.set(on);
+        let _ = ini_write("shell", "notchmedtemp", if on { "1" } else { "0" });
+        nt_live_sync();
+        nt_inval();
+        return;
+    }
+    if id == NI_SYS_ALWAYS {
+        // chip "Auto-hide"/"Selalu tampil": disimpan ke [shell] notchalways
+        let on = !NOTCH_ALWAYS.get();
+        NOTCH_ALWAYS.set(on);
+        let _ = ini_write("shell", "notchalways", if on { "1" } else { "0" });
+        nt_idle_apply();
+        nt_inval();
+        return;
+    }
+    if id == NI_SET {
+        NT_SET.set(!NT_SET.get());
+        nt_inval();
+        return;
+    }
+    if (NI_ST_SEC..NI_ST_SEC + 4).contains(&id) {
+        NT_SET_SEC.set(id - NI_ST_SEC);
+        nt_inval();
+        return;
+    }
+    if id == NI_ST_HUD {
+        let on = !NOTCH_HUD.get();
+        NOTCH_HUD.set(on);
+        let _ = ini_write("shell", "notchhud", if on { "1" } else { "0" });
+        nt_live_sync();
+        nt_inval();
+        return;
+    }
+    if id == NI_ST_NOTIF {
+        nt_ini_toggle(&NT_CFG_NOTIF, "notchnotif");
+        nt_inval();
+        return;
+    }
+    if id == NI_ST_ONLY {
+        if nt_ini_flag(&NT_CFG_NOTIF, "notchnotif") {
+            nt_ini_toggle(&NT_CFG_ONLY, "notchonly");
+        }
+        nt_inval();
+        return;
+    }
+    if (NI_ST_FSV..NI_ST_FSG + 3).contains(&id) {
+        let video = id < NI_ST_FSG;
+        let v = (id - if video { NI_ST_FSV } else { NI_ST_FSG }) as u8;
+        let (cell, key) = if video {
+            (&super::state::NOTCH_FS_VIDEO, "notchfsvideo")
+        } else {
+            (&super::state::NOTCH_FS_GAME, "notchfsgame")
+        };
+        cell.set(v);
+        let _ = ini_write("shell", key, &v.to_string());
+        nt_inval();
+        return;
+    }
+    if id == NI_SET_NOTIF {
+        nt_close(false);
+        shell_open("ms-settings:notifications");
+        return;
+    }
     if id == NI_NET || id == NI_BAT {
         nt_close(false);
         shell_open(if id == NI_NET { "ms-settings:network-status" } else { "ms-settings:batterysaver" });
@@ -1705,8 +2212,9 @@ fn nt_act(id: i32) {
     }
     if id == NI_MUTE {
         qs_toggle_mute(); // nilai baru juga datang lewat WM_VOLCHG
-    } else if (NI_TAB..NI_TAB + 3).contains(&id) {
+    } else if (NI_TAB..NI_TAB + 4).contains(&id) {
         NT_TAB.set(id - NI_TAB);
+        NT_SET.set(false);
         if NT_TAB.get() == NTT_NOTES {
             nt_notes_load();
         }
@@ -1720,6 +2228,12 @@ fn nt_act(id: i32) {
         pm_start(NT_PRESETS[(id - NI_PRESET) as usize]);
     } else if id == NI_PMSTOP {
         pm_stop();
+    } else if id == NI_PMADJ_DN || id == NI_PMADJ_UP {
+        // durasi kustom: langkah 5 menit, rentang 5..180 menit
+        let d = if id == NI_PMADJ_UP { 5 } else { -5 };
+        NT_PM_CUSTOM.set((NT_PM_CUSTOM.get() + d).clamp(5, 180));
+    } else if id == NI_PMCUSTOM {
+        pm_start(NT_PM_CUSTOM.get());
     } else if id == NI_NOTEFILE {
         let path = nt_note_path();
         if !path.exists() {
@@ -1775,8 +2289,8 @@ fn nt_key(vk: VIRTUAL_KEY) {
     } else if vk == VK_TAB {
         let raw = unsafe { GetKeyState(VK_SHIFT.0 as i32) };
         let shift = ((raw as u16) & 0x8000) != 0;
-        let step = if shift { 2 } else { 1 };
-        NT_TAB.set((NT_TAB.get() + step) % 3);
+        let step = if shift { 3 } else { 1 };
+        NT_TAB.set((NT_TAB.get() + step) % 4);
         if NT_TAB.get() == NTT_NOTES {
             nt_notes_load();
         }
@@ -1857,14 +2371,23 @@ fn nt_timer(id: usize) {
                 unsafe { SetTimer(Some(h), 2, 800, None) };
                 return;
             }
+            if st == NT_HUD && nt_notif_next() {
+                return;
+            }
             NT_HOVER_PEEK.set(false);
             NT_FULL.set(false);
             // lagu yang masih diputar kembali ke pulau ringkas; selain itu diam
-            nt_go(if nt_live_on() { NT_PEEK } else { NT_IDLE });
+            nt_go(if nt_live_on() && !NOTCH_MEDIA_TEMP.get() { NT_PEEK } else { NT_IDLE });
             nt_viz_sync();
         }
         5 => nt_poll(),
         6 => nt_viz_tick(),
+        7 => {
+            // Batas jeda media (NT_PAUSE_MS) tercapai: timer sekali jalan, lalu sinkronkan pulau.
+            // SAFETY: KillTimer hanya memakai handle jendela notch dan id timer.
+            let _ = unsafe { KillTimer(Some(h), 7) };
+            nt_live_sync();
+        }
         3 => {
             if NT_STATE.get() != NT_OPEN {
                 // SAFETY: timer 3 dipasang pada jendela notch ini (h).
@@ -2075,6 +2598,8 @@ pub unsafe extern "system" fn notch_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM
                 nt_inval();
                 return LRESULT(0);
             }
+            // posisi klik (koordinat jendela) dipakai NI_SEEK di nt_act untuk menghitung fraksi seek
+            NT_CLICK_X.set(nt_lp_x(lp) as f32);
             if hit >= 0 && hit == down {
                 nt_act(hit);
             }
@@ -2190,15 +2715,51 @@ pub fn notch_destroy() {
     *NT_ROUND.borrow_mut() = None;
 }
 
-// Tampil kecuali aplikasi layar penuh atau sedang keluar (w12notch.inc:1152-1175).
+/// Mode notch yang berlaku: 0 = normal, 1 = layar penuh (hanya notifikasi & status), 2 = layar penuh (juga media).
+static NT_FS_MODE: SyncCell<Cell<u8>> = SyncCell::new(Cell::new(0));
+
+/// Setelan pengguna untuk jenis layar penuh yang sedang di depan (0 sembunyi, 1 notifikasi, 2 notifikasi + media).
+fn nt_fs_policy() -> u8 {
+    match super::state::FS_KIND.get() {
+        1 => super::state::NOTCH_FS_VIDEO.get(),
+        _ => super::state::NOTCH_FS_GAME.get(),
+    }
+}
+
+/// true = layar penuh dengan mode "hanya notifikasi": tanpa intip media, pulau media, atau zona kursor.
+fn nt_fs_quiet() -> bool {
+    NT_FS_MODE.get() == 1
+}
+
+// Tampil kecuali sedang keluar atau layar penuh dengan setelan "sembunyi" (w12notch.inc:1152-1175).
 // Dipanggil dari ApplyPills saat keadaan fokus/layar penuh berubah.
 pub fn notch_sync() {
     let h = NT_WND.get();
     if h.0.is_null() {
         return;
     }
-    let want = !FULLSCREEN.get() && !QUITTING.get();
-    if want == NT_SHOWN.get() {
+    let fs = FULLSCREEN.get();
+    let pol = if fs { nt_fs_policy() } else { 0 };
+    let want = !QUITTING.get() && (!fs || pol > 0);
+    let mode = if fs && want { pol } else { 0 };
+    if want == NT_SHOWN.get() && mode == NT_FS_MODE.get() {
+        return;
+    }
+    NT_FS_MODE.set(mode);
+    if want && NT_SHOWN.get() {
+        // tetap boleh tampil, hanya mode yang berganti (masuk/keluar layar penuh): HUD/notifikasi yang sedang
+        // tampil dibiarkan selesai sendiri; keadaan lain kembali diam.
+        if NT_STATE.get() != NT_HUD {
+            if NT_STATE.get() == NT_OPEN {
+                nt_close(false);
+            }
+            nt_go(NT_IDLE);
+        }
+        nt_idle_apply();
+        nt_poll_arm(if mode == 1 { 0 } else { 400 });
+        if mode != 1 {
+            nt_live_sync();
+        }
         return;
     }
     if !want {
@@ -2219,6 +2780,7 @@ pub fn notch_sync() {
     // "boleh tampil"; dalam keadaan diam jendela tetap tersembunyi sampai zona panas dipicu
     NT_SHOWN.set(want);
     NT_STATE.set(NT_IDLE);
+    super::media_worker::set_tl_hot(false);
     NT_PREV.set(NT_IDLE);
     NT_T.set(1.0);
     NT_HOV.set(-1);
@@ -2226,10 +2788,21 @@ pub fn notch_sync() {
     NT_HOT_N.set(0);
     NT_TO.set(nt_target(NT_IDLE));
     // SAFETY: h adalah jendela notch yang valid.
-    let _ = unsafe { ShowWindow(h, SW_HIDE) };
-    nt_poll_arm(if want { 400 } else { 0 }); // layar penuh: tidak ada polling sama sekali
+    if want && NOTCH_ALWAYS.get() && mode == 0 {
+        // notchalways=1: garis diam tetap terlihat di tepi atas tengah (tidak di atas video/game)
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        notch_render();
+    } else {
+        let _ = unsafe { ShowWindow(h, SW_HIDE) };
+    }
+    // sembunyi atau "hanya notifikasi": tidak ada polling zona kursor sama sekali
+    nt_poll_arm(if want && mode != 1 { 400 } else { 0 });
     if want {
         nt_live_sync(); // kembali dari layar penuh: pulau ringkas media langsung tampil lagi bila diputar
+        nt_notif_next(); // notifikasi yang antre sebelum disembunyikan
     }
 }
 
@@ -2257,10 +2830,17 @@ pub fn notch_media() {
     };
     *NT_LAST_TITLE.borrow_mut() = title;
     // ganti putar/jeda (4 <-> 5) juga memicu intip, seperti lagu baru
+    if new_track && NOTCH_LYRICS.get() {
+        nt_lyr_want(); // lagu baru: cari lirik di thread latar (lyrics.rs); hasilnya datang lewat WM_W12_LYRIC
+    }
     let prev = NT_PLAY_PREV.get();
     NT_PLAY_PREV.set(status);
     let toggled = (prev == 4 && status == 5) || (prev == 5 && status == 4);
+    if status == 5 && prev != 5 {
+        NT_PAUSE_T0.set(nt_tick64());
+    }
     if NOTCH_HUD.get()
+        && !nt_fs_quiet()
         && ((new_track && status == 4) || toggled)
         && nt_tick64().wrapping_sub(NT_START.get()) > 8000
         && NT_STATE.get() != NT_OPEN
@@ -2279,7 +2859,9 @@ fn nt_live_sync() {
         return;
     }
     let st = NT_STATE.get();
-    if nt_live_on() {
+    // notchmedtemp=1: pulau tidak dipaksa menetap; hanya intip 3 detik (notch_media) yang memunculkannya
+    // layar penuh (mode 2): media hanya mengintip, tidak menetap di atas video/game
+    if nt_live_on() && !NOTCH_MEDIA_TEMP.get() && NT_FS_MODE.get() == 0 {
         if st == NT_IDLE {
             nt_go(NT_PEEK);
         }
@@ -2289,29 +2871,40 @@ fn nt_live_sync() {
     nt_viz_sync();
 }
 
-// Timer 6 (120 ms) hanya aktif selama pulau ringkas media tampil; menggerakkan bar visualizer.
+// Timer 6 (120 ms) hanya aktif selama media diputar dan pulau ringkas tampil; menggerakkan bar visualizer.
+// Timer 7 (sekali jalan) menutup pulau media jeda setelah NT_PAUSE_MS.
 fn nt_viz_sync() {
     let h = NT_WND.get();
     if h.0.is_null() {
         return;
     }
-    if nt_live_on() && NT_STATE.get() == NT_PEEK {
+    let playing = MEDIA.borrow().status == 4;
+    // timer 6 juga dipakai untuk menggambar ulang baris lirik yang berganti (pulau penuh)
+    if (nt_compact() || nt_lyric_line().is_some()) && NT_STATE.get() == NT_PEEK && playing {
         // SAFETY: h adalah jendela notch yang sudah dibuat; timer 6 hanya dipakai di sini.
         unsafe { SetTimer(Some(h), 6, 120, None) };
     } else {
         // SAFETY: KillTimer hanya memakai handle jendela notch dan id timer.
         let _ = unsafe { KillTimer(Some(h), 6) };
     }
+    if !playing && nt_live_on() {
+        let sisa = NT_PAUSE_MS.saturating_sub(nt_tick64().wrapping_sub(NT_PAUSE_T0.get()));
+        // SAFETY: h adalah jendela notch yang sudah dibuat; timer 7 hanya dipakai di sini.
+        unsafe { SetTimer(Some(h), 7, sisa.max(1) as u32, None) };
+    } else {
+        // SAFETY: KillTimer hanya memakai handle jendela notch dan id timer.
+        let _ = unsafe { KillTimer(Some(h), 7) };
+    }
 }
 
 fn nt_viz_tick() {
     let h = NT_WND.get();
-    if !NT_SHOWN.get() || !nt_live_on() || NT_STATE.get() != NT_PEEK {
+    if !NT_SHOWN.get() || !nt_live_on() || NT_STATE.get() != NT_PEEK || MEDIA.borrow().status != 4 {
         // SAFETY: KillTimer hanya memakai handle jendela notch dan id timer.
         let _ = unsafe { KillTimer(Some(h), 6) };
         return;
     }
-    if nt_compact() {
+    if nt_compact() || nt_lyric_line().is_some() {
         nt_inval();
     }
 }
@@ -2328,7 +2921,7 @@ pub fn notch_plug(charging: bool, pct: i32) {
     };
     nt_set_msg(&msg);
     NT_MSG_WARN.set(false);
-    NT_MSG_GLYPH.set(0);
+    NT_MSG_GLYPH.set(if charging { NT_GLYPH_CHG } else { 0 });
     NT_HUD_KIND.set(HUD_MSG);
     if NT_STATE.get() == NT_OPEN {
         nt_inval();
@@ -2388,8 +2981,8 @@ pub fn notch_power(lp: LPARAM) {
         return;
     }
     NT_BRI.set(v);
-    // HUD kecerahan hanya mode shell (ruling 4af)
-    if !NOTCH_HUD.get() || !SHELL_MODE.get() || PANEL_OPEN.get() == PN_QS {
+    // 2026-11-15: HUD kecerahan juga di mode default (permintaan pengguna: semua peringatan lewat notch).
+    if !NOTCH_HUD.get() || PANEL_OPEN.get() == PN_QS {
         return;
     }
     NT_HUD_KIND.set(HUD_BRI);
@@ -2399,7 +2992,7 @@ pub fn notch_power(lp: LPARAM) {
 // Peringatan baterai lemah: dipanggil BatteryUpdate. false = belum bisa tampil; pemanggil menunda
 // peringatan (w12notch.inc:1254-1267).
 pub fn notch_battery_alert(pct: i32) -> bool {
-    if !SHELL_MODE.get() || NT_WND.get().0.is_null() || !NT_SHOWN.get() {
+    if !NOTCH_HUD.get() || NT_WND.get().0.is_null() || !NT_SHOWN.get() {
         return false;
     }
     nt_set_msg(&format!("Baterai {}% \u{2014} sambungkan pengisi daya", pct));
@@ -2417,4 +3010,171 @@ pub fn notch_battery_alert(pct: i32) -> bool {
 // Menyalin teks ke NT_MSG (String), dipotong 95 karakter (Copy(g_ntMsg, ..., 96) di C).
 fn nt_set_msg(text: &str) {
     *NT_MSG.borrow_mut() = text.chars().take(95).collect();
+    NT_ALERT_RED.set(false);
+}
+
+// ---------------------------------------------------------------- peringatan dan notifikasi lewat notch (2026-11-15)
+
+/// Glyph pesan HUD_MSG berwarna merah (peringatan jaringan, dsb.). Direset tiap nt_set_msg.
+static NT_ALERT_RED: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+
+/// Satu notifikasi Windows yang dialihkan ke notch (notif_worker.rs).
+#[derive(Clone, Default)]
+pub struct NtNotif {
+    pub app: String,
+    pub title: String,
+    pub body: String,
+    pub aumid: String,
+    pub t: u64,
+}
+
+static NT_NOTIF_CUR: SyncCell<RefCell<Option<NtNotif>>> = SyncCell::new(RefCell::new(None));
+static NT_NOTIF_Q: SyncCell<RefCell<std::collections::VecDeque<NtNotif>>> =
+    SyncCell::new(RefCell::new(std::collections::VecDeque::new()));
+/// Riwayat notifikasi terbaru (paling baru di depan), ditampilkan di kartu Beranda saat notch terbuka.
+static NT_NOTIF_RECENT: SyncCell<RefCell<std::collections::VecDeque<NtNotif>>> =
+    SyncCell::new(RefCell::new(std::collections::VecDeque::new()));
+const NT_NOTIF_MS: u32 = 5500;
+
+/// Pesan satu baris di pulau: `glyph` 0 = ikon info, `red` = glyph merah (peringatan).
+/// Tidak menimpa notifikasi yang sedang tampil; tidak tampil saat layar penuh (NT_SHOWN false).
+pub fn notch_alert(text: &str, glyph: u16, red: bool, ms: u32) {
+    if !NOTCH_HUD.get() || NT_WND.get().0.is_null() || !NT_SHOWN.get() {
+        return;
+    }
+    if NT_STATE.get() == NT_HUD && NT_HUD_KIND.get() == HUD_NOTIF {
+        return;
+    }
+    nt_set_msg(text);
+    NT_ALERT_RED.set(red);
+    NT_MSG_WARN.set(false);
+    NT_MSG_GLYPH.set(glyph);
+    NT_HUD_KIND.set(HUD_MSG);
+    if NT_STATE.get() == NT_OPEN {
+        nt_inval();
+    } else {
+        nt_show_temp(NT_HUD, ms);
+    }
+}
+
+fn nt_notif_show(n: NtNotif) {
+    *NT_NOTIF_CUR.borrow_mut() = Some(n);
+    NT_HUD_KIND.set(HUD_NOTIF);
+    nt_show_temp(NT_HUD, NT_NOTIF_MS);
+}
+
+/// Notifikasi Windows baru. Masuk riwayat; tampil sebagai kartu di pulau (antre bila kartu lain masih tampil).
+pub fn notch_notify(n: NtNotif) {
+    {
+        let mut r = NT_NOTIF_RECENT.borrow_mut();
+        r.push_front(n.clone());
+        r.truncate(12);
+    }
+    if NT_WND.get().0.is_null() || !NT_SHOWN.get() {
+        return;
+    }
+    let st = NT_STATE.get();
+    if st == NT_OPEN {
+        nt_inval();
+        return;
+    }
+    if st == NT_HUD && NT_HUD_KIND.get() == HUD_NOTIF {
+        let mut q = NT_NOTIF_Q.borrow_mut();
+        if q.len() < 6 {
+            q.push_back(n);
+        }
+        return;
+    }
+    nt_notif_show(n);
+}
+
+/// Dipanggil saat HUD berakhir: tampilkan notifikasi berikutnya bila ada. true = ada yang ditampilkan.
+fn nt_notif_next() -> bool {
+    let next = NT_NOTIF_Q.borrow_mut().pop_front();
+    match next {
+        Some(n) => {
+            nt_notif_show(n);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Kartu notifikasi: lingkaran ikon, nama aplikasi, judul, dan isi (satu baris masing-masing).
+fn nt_draw_notif(w: f32, h: f32) {
+    let p = *PALETTE.borrow();
+    let cur = NT_NOTIF_CUR.borrow().clone();
+    let Some(n) = cur else {
+        return;
+    };
+    nt_hit(0.0, 0.0, w, h, NI_NOTIF);
+    let cx = sf(30.0);
+    let cy = h * 0.5;
+    fill_rr(cx - sf(16.0), cy - sf(16.0), cx + sf(16.0), cy + sf(16.0), sf(16.0), p.accent, 1.0);
+    glyph(0xEA8F, TF_GLYPH.borrow().as_ref(), cx, cy, sf(10.0), rgba(255, 255, 255, 1.0), 1.0);
+    let tx = sf(56.0);
+    let r = w - sf(18.0);
+    let app = if n.app.is_empty() { "Notifikasi".to_string() } else { n.app.clone() };
+    let ago = {
+        let s = nt_tick64().saturating_sub(n.t) / 1000;
+        if s < 60 { "sekarang".to_string() } else { format!("{} mnt", s / 60) }
+    };
+    let aw = measure_text(&ago, TF_XS.borrow().as_ref());
+    text(&app, TF_XS.borrow().as_ref(), tx, sf(8.0), r - aw - sf(8.0), sf(24.0), p.sub, 1.0);
+    nt_text_r(&ago, TF_XS.borrow().as_ref(), r, sf(8.0), sf(24.0), p.sub);
+    let title = if n.title.is_empty() { app.clone() } else { n.title.clone() };
+    text(&title, TF_SS.borrow().as_ref(), tx, sf(23.0), r, sf(43.0), p.text, 1.0);
+    if !n.body.is_empty() {
+        text(&n.body, TF_XS.borrow().as_ref(), tx, sf(42.0), r, sf(60.0), p.sub, 1.0);
+    }
+}
+
+/// Daftar notifikasi terbaru di kartu Beranda notch terbuka (maks `rows` baris). Mengembalikan true bila ada isi.
+fn nt_recent_rows(l: f32, t: f32, r: f32, rows: usize) -> bool {
+    let p = *PALETTE.borrow();
+    let list: Vec<NtNotif> = NT_NOTIF_RECENT.borrow().iter().take(rows).cloned().collect();
+    if list.is_empty() {
+        return false;
+    }
+    let row_h = sf(22.0);
+    for (i, n) in list.iter().enumerate() {
+        let y = t + i as f32 * row_h;
+        let app = if n.app.is_empty() { "Notifikasi" } else { n.app.as_str() };
+        let aw = measure_text(app, TF_XS.borrow().as_ref()).min((r - l) * 0.35);
+        text(app, TF_XS.borrow().as_ref(), l, y, l + aw + sf(2.0), y + row_h, p.sub, 1.0);
+        let line = if n.body.is_empty() { n.title.clone() } else { format!("{} \u{2014} {}", n.title, n.body) };
+        text(&line, TF_XS.borrow().as_ref(), l + aw + sf(10.0), y, r, y + row_h, p.text, 1.0);
+        nt_hit(l, y, r, y + row_h, NI_NOTIF_ROW + i as i32);
+    }
+    true
+}
+
+/// Tab Notifikasi di notch terbuka.
+const NTT_NOTIF: i32 = 3;
+const NI_NOTIF_CLEAR: i32 = 92;
+const NI_NOTIF_CENTER: i32 = 93;
+
+fn nt_notif_tab(l: f32, t: f32, r: f32, b: f32) {
+    let p = *PALETTE.borrow();
+    nt_card(l, t, r, b);
+    let pad = sf(12.0);
+    text("Notifikasi terbaru", TF_SS.borrow().as_ref(), l + pad, t + pad, r - pad, t + pad + sf(18.0), p.sub, 1.0);
+    nt_button(r - pad - sf(150.0), t + sf(8.0), r - pad - sf(78.0), t + sf(32.0), "Bersihkan", NI_NOTIF_CLEAR, false);
+    nt_button(r - pad - sf(72.0), t + sf(8.0), r - pad, t + sf(32.0), "Pusat", NI_NOTIF_CENTER, false);
+    let top = t + sf(42.0);
+    let rows = (((b - pad) - top) / sf(22.0)).floor().max(0.0) as usize;
+    if !nt_recent_rows(l + pad, top, r - pad, rows) {
+        let cy = (top + b) * 0.5;
+        glyph(0xEA8F, TF_GLYPH_LG.borrow().as_ref(), (l + r) * 0.5, cy - sf(14.0), sf(14.0), p.sub, 1.0);
+        wf_text_c("Belum ada notifikasi", TF_S.borrow().as_ref(), (l + r) * 0.5, cy + sf(6.0), cy + sf(24.0), &p.sub);
+    }
+}
+
+fn nt_open_notif_app(n: &NtNotif) {
+    nt_close(false);
+    if n.aumid.is_empty() {
+        shell_open("ms-actioncenter:");
+    } else {
+        shell_open(&format!("shell:AppsFolder\\{}", n.aumid));
+    }
 }

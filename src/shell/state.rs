@@ -43,6 +43,15 @@ pub const WM_W12_FXHITS: u32 = WM_APP + 23;
 pub const WM_W12_WALLCHG: u32 = WM_APP + 24;
 pub const WM_W12_DIAG: u32 = WM_APP + 25;
 pub const WM_W12_NEEDEXP: u32 = WM_APP + 26;
+/// Notifikasi Windows baru menunggu di antrean notif_worker.
+pub const WM_W12_NOTIF: u32 = WM_APP + 27;
+/// Tombol volume fisik/roda: wp = APPCOMMAND_VOLUME_UP/DOWN/MUTE. Dikirim dari kait keyboard (core_c4b.rs);
+/// Windows tidak menampilkan OSD volume bawaan karena tombol ditelan di kait.
+pub const WM_W12_VOLKEY: u32 = WM_APP + 28;
+/// Lirik untuk lagu aktif sudah diambil (lyrics.rs); UI cukup menggambar ulang notch.
+pub const WM_W12_LYRIC: u32 = WM_APP + 29;
+/// Pemberitahuan shell dari folder Start Menu/AppsFolder (start.rs `st_idx_register_notify`, 2026-11-24).
+pub const WM_W12_STARTNOTIFY: u32 = WM_APP + 30;
 
 // ---- Timer ----
 pub const T_CLOCK: i32 = 1;
@@ -65,6 +74,14 @@ pub const T_WALLPAPER: i32 = 17;
 pub const T_START_TRIM: i32 = 18;
 pub const T_FSSTART: i32 = 19;
 pub const T_DIAG: i32 = 20;
+/// Cek status internet (net_watch.rs).
+pub const T_NETCHK: i32 = 21;
+/// Animasi scroll halus dan animasi masuk "Semua aplikasi" (start_draw.rs).
+pub const T_ALLSCROLL: i32 = 22;
+/// Debounce pemindaian indeks aplikasi setelah perubahan Start Menu (start.rs, 2026-11-24).
+pub const T_APPIDX_DEBOUNCE: i32 = 23;
+/// Pemindaian berkala indeks aplikasi, untuk aplikasi Store/paket yang tidak memberi pemberitahuan.
+pub const T_APPIDX_POLL: i32 = 25;
 
 // ---- Tata letak, mode, jaringan (C1) ----
 pub const BAR_H: i32 = 48;
@@ -241,8 +258,9 @@ pub const PK_TARGET: PROPERTYKEY = PROPERTYKEY {
 pub const QS_ON_INK: D2D1_COLOR_F = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
 
 // ---- Global C1: jendela, tampilan, pengaturan ----
-pub static HI: SyncCell<Cell<HINSTANCE>> = SyncCell::new(Cell::new(HINSTANCE(std::ptr::null_mut())));
-pub static MSG: SyncCell<Cell<HWND>> = SyncCell::new(Cell::new(HWND(std::ptr::null_mut())));
+// Global yang juga dibaca thread pekerja/hook memakai pembungkus atomik (bebas data race).
+pub static HI: crate::sync::AtomicHandle<HINSTANCE> = crate::sync::AtomicHandle::null();
+pub static MSG: crate::sync::AtomicHandle<HWND> = crate::sync::AtomicHandle::null();
 pub static TIP: SyncCell<Cell<HWND>> = SyncCell::new(Cell::new(HWND(std::ptr::null_mut())));
 pub static WM_SHELLHOOK: SyncCell<Cell<u32>> = SyncCell::new(Cell::new(0));
 pub static WM_TASKBARCREATED: SyncCell<Cell<u32>> = SyncCell::new(Cell::new(0));
@@ -253,14 +271,29 @@ pub static APPS_TXT: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(Stri
 pub static MODE: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(MODE_SEGMENTED));
 pub static SMALL: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 pub static WIDGETS: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
-pub static WIN_KEY: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
+pub static WIN_KEY: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(true);
 pub static GLASS: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
 pub static DESK_LAYER: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
 pub static NOTCH_ON: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
 pub static NOTCH_HUD: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 // [shell] notchlive: pulau ringkas menetap saat media diputar (default aktif)
 pub static NOTCH_LIVE: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
-pub static SHELL_MODE: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+// [shell] notchalways: 1 = notch selalu terlihat sebagai garis kecil di tepi atas tengah; 0 = auto-hide (default).
+pub static NOTCH_ALWAYS: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+// [shell] notchlyrics: 1 = baris lirik tersinkron (LRCLIB) menggantikan artis di pulau media (default aktif).
+pub static NOTCH_LYRICS: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
+// [shell] notchmedtemp: 1 = pulau media hanya muncul sementara (intip 3 dtk saat lagu baru atau putar/jeda);
+// 0 = pulau media menetap selama media diputar (default, perilaku sebelumnya).
+pub static NOTCH_MEDIA_TEMP: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+// [shell] notchcompact: 1 = pulau media ringkas (sampul + bar, tanpa judul). Default 0: judul, artis, dan kontrol tampil selama media diputar.
+pub static NOTCH_COMPACT: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+// Notch saat layar penuh (2026-11-19): [shell] notchfsvideo / notchfsgame.
+// 0 = sembunyi total (jangan ganggu), 1 = notifikasi & status (volume, kecerahan, baterai), 2 = juga media dan zona kursor.
+pub static NOTCH_FS_VIDEO: SyncCell<Cell<u8>> = SyncCell::new(Cell::new(1));
+pub static NOTCH_FS_GAME: SyncCell<Cell<u8>> = SyncCell::new(Cell::new(1));
+// Jenis jendela layar penuh di depan: 0 = tidak layar penuh, 1 = video (peramban/pemutar), 2 = game/lainnya.
+pub static FS_KIND: SyncCell<Cell<u8>> = SyncCell::new(Cell::new(0));
+pub static SHELL_MODE: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
 pub static FILES_OWN: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
 pub static THEME_PREF: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(1));
 pub static ORIG_AUTO_HIDE: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(-1));
@@ -352,8 +385,13 @@ pub static HOT: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(-1));
 pub static TRACKING: SyncCell<Cell<[bool; MAXPILLS as usize]>> =
     SyncCell::new(Cell::new([false; MAXPILLS as usize]));
 pub static FULLSCREEN: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+/// Mode game: jendela depan fullscreen. Ditulis thread UI (`update_foreground`), dibaca thread kait keyboard.
+pub static GAME_FS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `[shell] gamehook` (hanya dibaca): 1 = kait tetap aktif saat fullscreen dengan logika minimum, 0 = kait dilepas
+/// saat fullscreen (hanya di luar mode shell; di mode shell kait dibutuhkan untuk Alt+Tab dan tombol Win).
+pub static GAME_HOOK: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(true));
 pub static FG_VALID: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-pub static QUITTING: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+pub static QUITTING: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
 pub static AB_REG: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 pub static PEEK: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 pub static FLY_OPEN: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
@@ -417,8 +455,8 @@ pub static NT: SyncCell<Cell<HWND>> = SyncCell::new(Cell::new(HWND(std::ptr::nul
 pub static NT_MSG: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
 pub static NT_MSG_WARN: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 pub static NT_MSG_GLYPH: SyncCell<Cell<u16>> = SyncCell::new(Cell::new(0));
-pub static FS_GEN: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
-pub static FS_RUNNING: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
+pub static FS_GEN: crate::sync::AtomicI32Cell = crate::sync::AtomicI32Cell::new(0);
+pub static FS_RUNNING: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
 pub static ST_ALL_APPS_MODE: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
 pub static ST_HITS_Q: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
 pub static ST_Q_LEN: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
@@ -440,6 +478,8 @@ pub const NT_OPEN: i32 = 3;
 pub const HUD_VOL: i32 = 0;
 pub const HUD_BRI: i32 = 1;
 pub const HUD_MSG: i32 = 2;
+/// Kartu notifikasi Windows (notif_worker.rs → notch_notify).
+pub const HUD_NOTIF: i32 = 3;
 pub const NTT_HOME: i32 = 0;
 pub const NTT_TIMER: i32 = 1;
 pub const NTT_NOTES: i32 = 2;

@@ -38,9 +38,15 @@ pub fn stop_listed(idx: i32) -> bool {
 }
 
 /// Memindai proses di sesi sendiri; `None` bila sesi atau snapshot tidak bisa diperoleh (C: return dini).
-fn stop_scan() -> Option<([[u32; 16]; W12STOP_COUNT], [usize; W12STOP_COUNT])> {
+/// Aplikasi Office yang memakai SDXHelper; selama salah satunya berjalan, SDXHelper tidak dihentikan.
+const OFFICE_APPS: [&str; 8] = [
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "onenote.exe", "msaccess.exe", "mspub.exe", "olk.exe",
+];
+
+fn stop_scan() -> Option<([[u32; 16]; W12STOP_COUNT], [usize; W12STOP_COUNT], bool)> {
     let mut pids = [[0u32; 16]; W12STOP_COUNT];
     let mut hit_n = [0usize; W12STOP_COUNT];
+    let mut office = false;
     unsafe {
         let mut my_sess = 0u32;
         ProcessIdToSessionId(GetCurrentProcessId(), &mut my_sess).ok()?;
@@ -52,6 +58,11 @@ fn stop_scan() -> Option<([[u32; 16]; W12STOP_COUNT], [usize; W12STOP_COUNT])> {
         pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snap, &mut pe).is_ok() {
             loop {
+                if !office {
+                    let n = pe.szExeFile.iter().position(|&c| c == 0).unwrap_or(pe.szExeFile.len());
+                    let exe = String::from_utf16_lossy(&pe.szExeFile[..n]).to_ascii_lowercase();
+                    office = OFFICE_APPS.contains(&exe.as_str());
+                }
                 let idx = w12_stop_index(&pe.szExeFile);
                 let ix = idx as usize;
                 if idx >= 0 && ix < W12STOP_COUNT && stop_listed(idx) && hit_n[ix] < 16 {
@@ -67,7 +78,7 @@ fn stop_scan() -> Option<([[u32; 16]; W12STOP_COUNT], [usize; W12STOP_COUNT])> {
             }
         }
         let _ = CloseHandle(snap);
-        Some((pids, hit_n))
+        Some((pids, hit_n, office))
     }
 }
 
@@ -117,7 +128,7 @@ pub fn stop_hosts_tick() {
     if !idxs[..n].iter().any(|&ix| !st.off[ix as usize]) {
         return; // semua nama sudah nonaktif: tidak perlu memindai lagi
     }
-    let Some((pids, hit_n)) = stop_scan() else {
+    let Some((pids, hit_n, office)) = stop_scan() else {
         return;
     };
     let now = unsafe { GetTickCount64() };
@@ -126,8 +137,11 @@ pub fn stop_hosts_tick() {
         if hit_n[ix] == 0 {
             continue;
         }
-        let act = w12_stop_decide(&mut st, idx, now);
         let name = w12_stop_name(idx).unwrap_or("");
+        if office && name == "SDXHelper.exe" {
+            continue; // Office sedang dipakai: pembantunya dibiarkan
+        }
+        let act = w12_stop_decide(&mut st, idx, now);
         if act == W12STOP_TERMINATE {
             for &pid in &pids[ix][..hit_n[ix]] {
                 let ok = stop_kill(pid);

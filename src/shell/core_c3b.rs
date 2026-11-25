@@ -43,6 +43,10 @@ pub const CMD_SWITCH: i32 = 110;
 pub const CMD_APP_OPEN: i32 = 200;
 pub const CMD_APP_PIN: i32 = 201;
 pub const CMD_APP_CLOSE: i32 = 202;
+pub const CMD_APP_SPIN: i32 = 203;
+pub const CMD_APP_GROUP: i32 = 204;
+pub const CMD_APP_ADMIN: i32 = 205;
+pub const CMD_APP_LOC: i32 = 206;
 pub const CMD_WIN0: i32 = 300;
 pub const CMD_RECENT0: i32 = 400;
 pub const JL_MAX: u32 = 8;
@@ -377,35 +381,27 @@ pub fn desk_fit() {
 }
 
 /// `DeskMenu(pt)`: menu klik kanan desktop.
+/// Menu latar (Tampilan, Tempel, Baru, wallpaper, ...) kini ada di desk_icons.rs.
 pub fn desk_menu(pt: POINT) {
-    let Ok(m) = (unsafe { CreatePopupMenu() }) else {
-        return;
-    };
-    let _ = unsafe { AppendMenuW(m, MF_STRING, 4, w!("Segarkan")) };
-    let _ = unsafe { AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null()) };
-    desk_wall_menu_add(m);
-    let _ = unsafe { AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null()) };
-    let _ = unsafe { AppendMenuW(m, MF_STRING, 1, w!("Personalisasi")) };
-    let _ = unsafe { AppendMenuW(m, MF_STRING, 2, w!("Pengaturan layar")) };
-    let _ = unsafe { AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null()) };
-    let _ = unsafe { AppendMenuW(m, MF_STRING, 3, w!("Menu Win12 Shell")) };
-    let c = track_menu(m, DESK.get(), pt, false);
-    let _ = unsafe { DestroyMenu(m) };
-    if desk_wall_cmd(c) {
-        return;
-    }
-    match c {
-        1 => shell_open("ms-settings:personalization"),
-        2 => shell_open("ms-settings:display"),
-        3 => main_menu(MSG.get(), pt, false),
-        4 => super::desk_icons::desk_icons_reload(),
-        _ => {}
-    }
+    super::desk_icons::desk_background_menu(pt);
 }
 
 /// `DeskProc`: WNDPROC jendela desktop "Progman" Win12.
 pub unsafe extern "system" fn desk_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Ikon desktop: mouse, keyboard, menu shell, ganti nama, pemberitahuan perubahan.
+    if let Some(r) = super::desk_icons::desk_icons_on_message(h, m, wp, lp) {
+        return r;
+    }
     match m {
+        // Tombol Win saat jendela admin (mis. Task Manager) aktif: kait LL tidak dipanggil (UIPI), Windows
+        // memposting WM_SYSCOMMAND SC_TASKLIST ke jendela shell (GetShellWindow = jendela desktop ini).
+        windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND
+            if super::state::SHELL_MODE.get()
+                && ((wp.0 as u32) & 0xFFF0) == windows::Win32::UI::WindowsAndMessaging::SC_TASKLIST =>
+        {
+            crate::shell::hotkeys::hk_task_list();
+            return LRESULT(0);
+        }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = unsafe { zeroed() };
@@ -440,22 +436,6 @@ pub unsafe extern "system" fn desk_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM)
             super::desk_icons::desk_icons_layout();
             desk_wall_load();
             let _ = unsafe { InvalidateRect(Some(h), None, true) };
-        }
-        WM_RBUTTONUP => {
-            // GET_X_LPARAM / GET_Y_LPARAM: koordinat klien bertanda 16 bit
-            let x = (lp.0 & 0xFFFF) as i16 as i32;
-            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-            let mut pt = POINT { x, y };
-            let _ = unsafe { ClientToScreen(h, &mut pt) };
-            desk_menu(pt);
-            return LRESULT(0);
-        }
-        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            // Koordinat klien 16 bit bertanda, seperti WM_RBUTTONUP di atas. Klik ganda membuka ikon.
-            let x = (lp.0 & 0xFFFF) as i16 as i32;
-            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-            super::desk_icons::desk_icons_click(x, y, m == WM_LBUTTONDBLCLK);
-            return LRESULT(0);
         }
         WM_CLOSE => return LRESULT(0), // Alt+F4 di desktop: desktop tidak boleh tertutup
         _ => {}
@@ -714,8 +694,7 @@ pub fn dock_number(n: i32) {
     quiet_start(1000);
     if pick == W12DK_MINIMIZE {
         if let Some(&first) = wins.first() {
-            // SAFETY: first diambil dari daftar jendela app yang masih dicatat.
-            let _ = unsafe { ShowWindowAsync(first, SW_MINIMIZE) };
+            minimize_dock_window(first);
         }
     } else if let Some(&w) = usize::try_from(pick).ok().and_then(|p| wins.get(p)) {
         activate_window(w);
@@ -828,6 +807,112 @@ pub fn toggle_pin(s: &App) {
     }
     save_apps();
     start_lists_invalidate(); // C: TogglePin (win12shell.cpp:3761)
+    relayout();
+}
+
+/// Identitas apps.txt dari nama parsing Start (`shell:AppsFolder\<AUMID>` -> AUMID; jalur tetap jalur).
+pub fn ident_from_parsing(parsing: &str) -> String {
+    let p = parsing.trim();
+    let low = p.to_ascii_lowercase();
+    if low.starts_with("shell:appsfolder\\") {
+        p["shell:AppsFolder\\".len()..].to_string()
+    } else {
+        p.to_string()
+    }
+}
+
+/// Indeks `APPS` untuk identitas apps.txt (AUMID atau jalur launch/exe), tanpa membedakan huruf besar-kecil.
+pub fn app_index_by_ident(ident: &str) -> Option<usize> {
+    if ident.is_empty() {
+        return None;
+    }
+    let is_path = ident.contains('\\') || ident.contains('/');
+    APPS.borrow().iter().position(|a| {
+        if is_path {
+            a.aumid.is_empty() && (a.launch.eq_ignore_ascii_case(ident) || a.exe.eq_ignore_ascii_case(ident))
+        } else {
+            a.aumid.eq_ignore_ascii_case(ident)
+        }
+    })
+}
+
+/// (disematkan di Start, disematkan di taskbar) untuk identitas apps.txt.
+pub fn ident_pin_state(ident: &str) -> (bool, bool) {
+    match app_index_by_ident(ident) {
+        Some(i) => APPS.borrow().get(i).map_or((false, false), |a| (a.spin > 0, a.pin >= 0)),
+        None => (false, false),
+    }
+}
+
+/// Sematkan/lepas dari Start (2026-11-15). Aplikasi yang belum ada di `APPS` dibuat dari `resolve_entry`.
+/// Melepas aplikasi tanpa jendela dan tanpa pin taskbar menghapusnya dari daftar, seperti `toggle_pin`.
+pub fn start_pin_toggle_ident(ident: &str) {
+    let idx = app_index_by_ident(ident);
+    {
+        let mut apps = APPS.borrow_mut();
+        let top = apps.iter().map(|a| a.spin).fold(0, i32::max);
+        match idx {
+            Some(i) if apps[i].spin > 0 => {
+                let k = apps[i].spin;
+                apps[i].spin = 0;
+                for a in apps.iter_mut() {
+                    if a.spin > k {
+                        a.spin -= 1;
+                    }
+                }
+                if apps[i].pin < 0 && apps[i].wins.is_empty() {
+                    let mut gone = apps.remove(i);
+                    icon_free(&mut gone.icon);
+                }
+            }
+            Some(i) => apps[i].spin = top + 1,
+            None => {
+                if apps.len() >= MAXAPPS as usize {
+                    return;
+                }
+                drop(apps);
+                let Some(mut a) = resolve_entry(ident) else {
+                    log(&format!("start: sematkan gagal, identitas tidak dikenal: {ident}"));
+                    return;
+                };
+                a.spin = top + 1;
+                a.pin = -1;
+                APPS.borrow_mut().push(a);
+            }
+        }
+    }
+    save_apps();
+    start_lists_invalidate();
+    super::start::st_all_apps_invalidate();
+    relayout();
+}
+
+/// Sematkan/lepas dari taskbar berdasarkan identitas (menu Start, 2026-11-15).
+pub fn taskbar_pin_toggle_ident(ident: &str) {
+    if let Some(i) = app_index_by_ident(ident) {
+        let snap = {
+            let apps = APPS.borrow();
+            let a = &apps[i];
+            App { aumid: a.aumid.clone(), exe: a.exe.clone(), launch: a.launch.clone(), ..Default::default() }
+        };
+        toggle_pin(&snap);
+        return;
+    }
+    if APPS.borrow().len() >= MAXAPPS as usize {
+        return;
+    }
+    let Some(mut a) = resolve_entry(ident) else {
+        log(&format!("taskbar: sematkan gagal, identitas tidak dikenal: {ident}"));
+        return;
+    };
+    if a.launch.is_empty() {
+        return;
+    }
+    a.pin = 1;
+    APPS.borrow_mut().push(a);
+    save_apps();
+    start_lists_invalidate();
+    super::start::st_all_apps_invalidate();
     relayout();
 }
 
@@ -995,16 +1080,37 @@ pub fn app_menu(owner: HWND, pt: POINT, ai: i32) {
         // SAFETY: separator tanpa teks.
         let _ = unsafe { AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null()) };
     }
+    // 2026-11-15: menu dilengkapi (admin, sematkan Start, grup segmented, lokasi file), label Bahasa Indonesia.
+    let ident = if snap.aumid.is_empty() { snap.launch.clone() } else { snap.aumid.clone() };
+    let packaged = snap.aumid.contains('!');
     if !snap.launch.is_empty() {
-        let nama = if snap.name.is_empty() { "Open" } else { snap.name.as_str() };
+        let nama = if snap.name.is_empty() { "Buka" } else { snap.name.as_str() };
         append_text(m, MF_STRING, CMD_APP_OPEN, nama);
+        if !packaged && !snap.exe.is_empty() {
+            append_text(m, MF_STRING, CMD_APP_ADMIN, "Jalankan sebagai administrator");
+        }
+        // SAFETY: separator tanpa teks.
+        let _ = unsafe { AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null()) };
     }
     if !snap.launch.is_empty() || snap.pin >= 0 {
-        let teks = if snap.pin >= 0 { "Unpin from taskbar" } else { "Pin to taskbar" };
+        let teks = if snap.pin >= 0 { "Lepas dari taskbar" } else { "Sematkan ke taskbar" };
         append_text(m, MF_STRING, CMD_APP_PIN, teks);
     }
+    if !ident.is_empty() {
+        let teks = if snap.spin > 0 { "Lepas dari Start" } else { "Sematkan ke Start" };
+        append_text(m, MF_STRING, CMD_APP_SPIN, teks);
+    }
+    if MODE.get() == MODE_SEGMENTED && snap.pin >= 0 {
+        let teks = if snap.pin == 0 { "Pindah ke grup kanan" } else { "Pindah ke grup kiri" };
+        append_text(m, MF_STRING, CMD_APP_GROUP, teks);
+    }
+    if !snap.exe.is_empty() {
+        append_text(m, MF_STRING, CMD_APP_LOC, "Buka lokasi file");
+    }
     if nwin > 0 {
-        let teks = if nwin > 1 { "Close all windows" } else { "Close window" };
+        // SAFETY: separator tanpa teks.
+        let _ = unsafe { AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null()) };
+        let teks = if nwin > 1 { "Tutup semua jendela" } else { "Tutup jendela" };
         append_text(m, MF_STRING, CMD_APP_CLOSE, teks);
     }
     let cmd = track_menu(m, owner, pt, false);
@@ -1032,6 +1138,29 @@ pub fn app_menu(owner: HWND, pt: POINT, ai: i32) {
         }
     } else if cmd == CMD_APP_PIN {
         toggle_pin(&snap);
+    } else if cmd == CMD_APP_SPIN {
+        start_pin_toggle_ident(&ident);
+    } else if cmd == CMD_APP_GROUP {
+        if let Some(i) = app_index_by_identity(&snap) {
+            {
+                let mut apps = APPS.borrow_mut();
+                if apps[i].pin >= 0 {
+                    apps[i].pin = 1 - apps[i].pin.min(1);
+                }
+            }
+            save_apps();
+            relayout();
+        }
+    } else if cmd == CMD_APP_ADMIN {
+        let wexe = to_wide_z(&snap.exe);
+        // SAFETY: wexe hidup selama pemanggilan; verba "runas" memunculkan UAC.
+        unsafe {
+            ShellExecuteW(None, w!("runas"), pcw(&wexe), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        }
+    } else if cmd == CMD_APP_LOC {
+        if let Some((dir, _)) = snap.exe.rsplit_once('\\') {
+            open_folder_window(dir);
+        }
     }
     jump_list_free();
 }
@@ -1144,7 +1273,11 @@ pub fn update_foreground(force: bool) {
     let old_rect = FG_RECT.get();
     // SAFETY: kedua RECT hidup selama pemanggilan.
     let same_rect = unsafe { EqualRect(&fr, &old_rect) }.as_bool();
-    if !force && !pop_was && valid == FG_VALID.get() && fs == FULLSCREEN.get() && (!valid || same_rect) {
+    // Jenis layar penuh untuk notch pintar: video (peramban/pemutar) atau game (selain itu).
+    let kind = if fs { fs_kind(fg) } else { 0 };
+    let kind_same = kind == super::state::FS_KIND.get();
+    super::state::FS_KIND.set(kind);
+    if !force && !pop_was && kind_same && valid == FG_VALID.get() && fs == FULLSCREEN.get() && (!valid || same_rect) {
         apply_pills(false); // keadaan fokus sama, tetapi flyout dok mungkin baru ditutup
         base_update(false); // jendela lain bisa saja baru dipulihkan/diminimalkan
         return;
@@ -1152,6 +1285,17 @@ pub fn update_foreground(force: bool) {
     FG_VALID.set(valid);
     FG_RECT.set(fr);
     FULLSCREEN.set(fs);
+    // Mode game: kait keyboard membaca GAME_FS. Dengan gamehook=0 (di luar mode shell) kait dilepas selama fullscreen.
+    let game_was = GAME_FS.swap(fs, std::sync::atomic::Ordering::Relaxed);
+    if game_was != fs && !GAME_HOOK.get() && !SHELL_MODE.get() {
+        if fs {
+            crate::shell::core_c4b::kb_hook_stop();
+            log("mode game: fullscreen, kait keyboard dilepas (gamehook=0)");
+        } else {
+            crate::shell::core_c4b::kb_hook_start();
+            log("mode game: keluar fullscreen, kait keyboard aktif lagi");
+        }
+    }
     base_update(false); // sebelum release_mem: alas yang memudar keluar masih memakai buffer bersama
     if fs {
         // Dock tidak tampil saat fullscreen: lepas buffer dan kecilkan working set.
@@ -1160,6 +1304,68 @@ pub fn update_foreground(force: bool) {
         crate::shell::core_c4::trim_working_set(true);
     }
     apply_pills(false);
+}
+
+/// Proses yang layar penuhnya dianggap video. `[shell] notchvideoapps` menambah nama exe lain (dipisah koma,
+/// tanpa ".exe"). Semua layar penuh lain dianggap game.
+const FS_VIDEO_EXES: &[&str] = &[
+    "zen", "firefox", "chrome", "msedge", "brave", "opera", "opera_gx", "vivaldi", "librewolf", "floorp",
+    "waterfox", "thorium", "chromium", "arc", "vlc", "mpv", "mpc-hc", "mpc-hc64", "mpc-be", "mpc-be64",
+    "potplayer", "potplayermini", "potplayermini64", "wmplayer", "applicationframehost", "microsoft.media.player",
+    "kodi", "plex", "stremio", "spotify", "netflix", "smplayer", "mpvnet", "celluloid", "obs64",
+];
+
+/// Jendela terakhir yang jenisnya sudah dihitung: T_FGPOLL (500 ms) tidak membuka proses berulang selama layar penuh.
+static FS_KIND_CACHE: SyncCell<Cell<(isize, u8)>> = SyncCell::new(Cell::new((0, 0)));
+
+/// 1 = video, 2 = game.
+fn fs_kind(h: HWND) -> u8 {
+    let (ch, ck) = FS_KIND_CACHE.get();
+    if ch == h.0 as isize && ck != 0 {
+        return ck;
+    }
+    let k = fs_kind_uncached(h);
+    FS_KIND_CACHE.set((h.0 as isize, k));
+    k
+}
+
+fn fs_kind_uncached(h: HWND) -> u8 {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let mut pid = 0u32;
+    // SAFETY: pid lokal; h dari GetForegroundWindow.
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid as *mut u32)) };
+    if pid == 0 {
+        return 2;
+    }
+    let mut name = String::new();
+    // SAFETY: handle proses ditutup sebelum keluar; buffer lokal.
+    unsafe {
+        if let Ok(hp) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut buf = [0u16; 260];
+            let mut n = buf.len() as u32;
+            if QueryFullProcessImageNameW(hp, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut n)
+                .is_ok()
+            {
+                name = String::from_utf16_lossy(&buf[..n as usize]);
+            }
+            let _ = windows::Win32::Foundation::CloseHandle(hp);
+        }
+    }
+    let base = name.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base).to_string();
+    if base.is_empty() {
+        return 2;
+    }
+    if FS_VIDEO_EXES.contains(&base.as_str()) {
+        return 1;
+    }
+    let extra = super::core_c1::ini_string("shell", "notchvideoapps", "", 512).to_ascii_lowercase();
+    if extra.split(',').map(|s| s.trim().trim_end_matches(".exe")).any(|s| !s.is_empty() && s == base) {
+        return 1;
+    }
+    2
 }
 
 /// `ScheduleRefresh()`: jadwalkan penyegaran keadaan fokus 60 ms lagi (timer `T_REFRESH`).

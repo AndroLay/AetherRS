@@ -19,9 +19,123 @@ struct SnapSlot {
     state: i32,
     has_restore: bool,
     restore: RECT,
+    /// Area snap terakhir (fraksi area kerja kiri, atas, kanan, bawah); None = tidak di-snap. Untuk grup snap.
+    frac: Option<[f32; 4]>,
+    /// Urutan snap (makin besar = makin baru).
+    seq: u64,
 }
 
 static SNAP_SLOTS: SyncCell<RefCell<Vec<SnapSlot>>> = SyncCell::new(RefCell::new(Vec::new()));
+static SNAP_SEQ: SyncCell<Cell<u64>> = SyncCell::new(Cell::new(0));
+
+/// Catat keadaan dan area snap `h` (dipakai grup snap Alt+Tab).
+fn snap_set(h: HWND, state: i32, frac: Option<[f32; 4]>) {
+    let seq = SNAP_SEQ.get() + 1;
+    SNAP_SEQ.set(seq);
+    snap_with(h, |sl| {
+        sl.state = state;
+        sl.frac = frac;
+        sl.seq = seq;
+    });
+}
+
+/// Tata letak snap baku (fraksi area kerja: kiri, atas, kanan, bawah): setengah kiri/kanan/atas/bawah,
+/// empat kuadran, tiga sepertiga, dan dua pertiga kiri/kanan. Sama dengan Windows 11 dan menu Win+Z.
+const SNAP_STD_FRACS: [[f32; 4]; 13] = [
+    [0.0, 0.0, 0.5, 1.0],
+    [0.5, 0.0, 1.0, 1.0],
+    [0.0, 0.0, 1.0, 0.5],
+    [0.0, 0.5, 1.0, 1.0],
+    [0.0, 0.0, 0.5, 0.5],
+    [0.5, 0.0, 1.0, 0.5],
+    [0.0, 0.5, 0.5, 1.0],
+    [0.5, 0.5, 1.0, 1.0],
+    [0.0, 0.0, 1.0 / 3.0, 1.0],
+    [1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0],
+    [2.0 / 3.0, 0.0, 1.0, 1.0],
+    [0.0, 0.0, 2.0 / 3.0, 1.0],
+    [1.0 / 3.0, 0.0, 1.0, 1.0],
+];
+
+/// Toleransi (px fisik) antara bingkai nyata dan area snap yang diharapkan.
+const SNAP_MATCH_TOL: f32 = 16.0;
+
+/// Apakah bingkai terlihat `fr` cocok dengan fraksi `f` dari area kerja `work`.
+fn frac_matches(work: &RECT, fr: &RECT, f: &[f32; 4]) -> bool {
+    let ww = (work.right - work.left) as f32;
+    let hh = (work.bottom - work.top) as f32;
+    let exp = [
+        work.left as f32 + ww * f[0],
+        work.top as f32 + hh * f[1],
+        work.left as f32 + ww * f[2],
+        work.top as f32 + hh * f[3],
+    ];
+    let got = [fr.left as f32, fr.top as f32, fr.right as f32, fr.bottom as f32];
+    exp.iter().zip(got.iter()).all(|(a, b)| (a - b).abs() <= SNAP_MATCH_TOL)
+}
+
+/// Grup snap (seperti Windows 11): jendela yang di-snap berdampingan di satu monitor, tidak saling tumpang
+/// tindih, masih di posisi snap-nya, dan tidak diminimalkan. Tiap grup 2–4 jendela, terbaru dulu.
+/// Fraksi area relatif terhadap area kerja monitor.
+///
+/// 2026-11-23: `zorder` = jendela kartu Alt+Tab (urutan Z, terdepan dulu). Selain jendela yang di-snap lewat
+/// Win12 (Win+panah, Win+Z), jendela yang posisinya cocok dengan tata letak snap baku juga dihitung, sehingga
+/// snap bawaan Windows (Snap Assist, seret ke tepi, menu tombol maksimalkan) ikut tergabung. Sebelumnya hanya
+/// catatan Win12 yang dipakai, sehingga grup sering hanya berisi satu jendela dan tidak terbentuk.
+pub fn snap_groups(zorder: &[HWND]) -> Vec<Vec<(HWND, [f32; 4])>> {
+    snap_prune();
+    // (hwnd, fraksi, seq, monitor, peringkat Z)
+    let mut cands: Vec<(HWND, [f32; 4], u64, isize, usize)> = Vec::new();
+    let slots: Vec<SnapSlot> = SNAP_SLOTS.borrow().clone();
+    let mut hs: Vec<HWND> = zorder.to_vec();
+    for sl in &slots {
+        if sl.frac.is_some() && !hs.contains(&sl.hwnd) {
+            hs.push(sl.hwnd);
+        }
+    }
+    for (rank, &h) in hs.iter().enumerate() {
+        if !unsafe { IsWindowVisible(h) }.as_bool() || is_iconic(h) || is_zoomed(h) {
+            continue;
+        }
+        let Some((work, _wr, fr)) = monitor_and_frame(h) else { continue };
+        let rec = slots.iter().find(|sl| sl.hwnd == h).and_then(|sl| sl.frac.map(|f| (f, sl.seq)));
+        // Catatan Win12 didahulukan bila posisinya masih cocok; selain itu cocokkan ke tata letak baku.
+        let (f, seq) = match rec {
+            Some((f, seq)) if frac_matches(&work, &fr, &f) => (f, seq),
+            _ => match SNAP_STD_FRACS.iter().find(|f| frac_matches(&work, &fr, f)) {
+                Some(f) => (*f, 0),
+                None => continue,
+            },
+        };
+        let mon = unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+        cands.push((h, f, seq, mon, rank));
+    }
+    // Snap Win12 terbaru dulu, lalu urutan Z (jendela yang lebih depan dulu).
+    cands.sort_by(|a, b| b.2.cmp(&a.2).then(a.4.cmp(&b.4)));
+    let overlap = |a: &[f32; 4], b: &[f32; 4]| a[0] < b[2] - 0.01 && b[0] < a[2] - 0.01 && a[1] < b[3] - 0.01 && b[1] < a[3] - 0.01;
+    let mut used = vec![false; cands.len()];
+    let mut out = Vec::new();
+    for i in 0..cands.len() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        let mut g = vec![(cands[i].0, cands[i].1)];
+        for j in (i + 1)..cands.len() {
+            if used[j] || cands[j].3 != cands[i].3 || g.len() >= 4 {
+                continue;
+            }
+            if g.iter().all(|(_, f)| !overlap(f, &cands[j].1)) {
+                used[j] = true;
+                g.push((cands[j].0, cands[j].1));
+            }
+        }
+        if g.len() >= 2 {
+            out.push(g);
+        }
+    }
+    out
+}
 
 /// Item menu tata letak (`kItems` di SnapLayoutMenu). Id 0 adalah pemisah.
 const SNAP_MENU: &[(i32, &str)] = &[
@@ -57,6 +171,8 @@ fn slot_index(slots: &mut Vec<SnapSlot>, h: HWND) -> usize {
         state: W12SN_RESTORED,
         has_restore: false,
         restore: RECT::default(),
+        frac: None,
+        seq: 0,
     });
     slots.len() - 1
 }
@@ -216,7 +332,7 @@ pub fn snap_key(vk: i32) {
             snap_place(w, next);
         }
     }
-    snap_with(w, |sl| sl.state = next);
+    snap_set(w, next, w12_snap_frac(next));
 }
 
 /// Tata letak snap (`SnapLayout`). Fraksi per enam area kerja, urutan sama dengan SNL_LEFT..SNL_R23.
@@ -244,7 +360,7 @@ pub fn snap_layout(w: HWND, layout: i32) {
         unsafe {
             let _ = ShowWindow(w, SW_MAXIMIZE);
         }
-        snap_with(w, |sl| sl.state = W12SN_MAX);
+        snap_set(w, W12SN_MAX, None);
         return;
     }
     if is_iconic(w) || is_zoomed(w) {
@@ -293,8 +409,17 @@ pub fn snap_layout(w: HWND, layout: i32) {
         );
     }
     // bukan RESTORED: Win+↓ memulihkan rect semula
-    let next = if f[0] > 0 && f[2] == 6 { W12SN_RIGHT } else { W12SN_LEFT };
-    snap_with(w, |sl| sl.state = next);
+    // Kuadran memakai keadaan kuadran (Win+panah berikutnya bergerak antarkuadran); lainnya kiri/kanan.
+    let next = match layout - SNL_LEFT {
+        4 => W12SN_TL,
+        5 => W12SN_TR,
+        6 => W12SN_BL,
+        7 => W12SN_BR,
+        _ if f[0] > 0 && f[2] == 6 => W12SN_RIGHT,
+        _ => W12SN_LEFT,
+    };
+    let frac = [f[0] as f32 / 6.0, f[1] as f32 / 6.0, f[2] as f32 / 6.0, f[3] as f32 / 6.0];
+    snap_set(w, next, Some(frac));
 }
 
 /// Win+Z: menu tata letak di tepi atas jendela depan (`SnapLayoutMenu`).

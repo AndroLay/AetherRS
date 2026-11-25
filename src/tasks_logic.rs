@@ -354,6 +354,24 @@ pub const W12SN_LEFT: i32 = 1;
 pub const W12SN_RIGHT: i32 = 2;
 pub const W12SN_MAX: i32 = 3;
 pub const W12SN_MIN: i32 = 4;
+/// Kuadran (2026-11-19, seperti Windows 11): kiri atas, kiri bawah, kanan atas, kanan bawah.
+pub const W12SN_TL: i32 = 5;
+pub const W12SN_BL: i32 = 6;
+pub const W12SN_TR: i32 = 7;
+pub const W12SN_BR: i32 = 8;
+
+/// Fraksi area kerja (kiri, atas, kanan, bawah) untuk keadaan snap; None bila bukan keadaan ber-area (RESTORED/MAX/MIN).
+pub fn w12_snap_frac(state: i32) -> Option<[f32; 4]> {
+    Some(match state {
+        W12SN_LEFT => [0.0, 0.0, 0.5, 1.0],
+        W12SN_RIGHT => [0.5, 0.0, 1.0, 1.0],
+        W12SN_TL => [0.0, 0.0, 0.5, 0.5],
+        W12SN_BL => [0.0, 0.5, 0.5, 1.0],
+        W12SN_TR => [0.5, 0.0, 1.0, 0.5],
+        W12SN_BR => [0.5, 0.5, 1.0, 1.0],
+        _ => return None,
+    })
+}
 
 pub const W12SK_LEFT: i32 = 0;
 pub const W12SK_RIGHT: i32 = 1;
@@ -372,14 +390,19 @@ pub struct W12RectI {
 /// Keadaan berikutnya (`W12SnapNext`). Baris: keadaan (RESTORED, LEFT, RIGHT, MAX, MIN); kolom: tombol (←, →, ↑, ↓).
 /// MIN memakai baris RESTORED (tidak ada di tabel plan; ruling 5l). Nilai di luar rentang: RESTORED.
 pub fn w12_snap_next(state: i32, key: i32) -> i32 {
-    const NEXT: [[i32; 4]; 5] = [
-        [W12SN_LEFT, W12SN_RIGHT, W12SN_MAX, W12SN_MIN],          // RESTORED
-        [W12SN_LEFT, W12SN_RESTORED, W12SN_MAX, W12SN_RESTORED],  // LEFT
-        [W12SN_RESTORED, W12SN_RIGHT, W12SN_MAX, W12SN_RESTORED], // RIGHT
-        [W12SN_LEFT, W12SN_RIGHT, W12SN_MAX, W12SN_RESTORED],     // MAX
-        [W12SN_LEFT, W12SN_RIGHT, W12SN_MAX, W12SN_MIN],          // MIN (sama dengan RESTORED)
+    // 2026-11-19: dari setengah kiri/kanan, ↑/↓ menjadi kuadran (seperti Windows 11); dari kuadran ←/→ pindah sisi.
+    const NEXT: [[i32; 4]; 9] = [
+        [W12SN_LEFT, W12SN_RIGHT, W12SN_MAX, W12SN_MIN],      // RESTORED
+        [W12SN_LEFT, W12SN_RESTORED, W12SN_TL, W12SN_BL],     // LEFT
+        [W12SN_RESTORED, W12SN_RIGHT, W12SN_TR, W12SN_BR],    // RIGHT
+        [W12SN_LEFT, W12SN_RIGHT, W12SN_MAX, W12SN_RESTORED], // MAX
+        [W12SN_LEFT, W12SN_RIGHT, W12SN_MAX, W12SN_MIN],      // MIN (sama dengan RESTORED)
+        [W12SN_TL, W12SN_TR, W12SN_MAX, W12SN_LEFT],          // TL
+        [W12SN_BL, W12SN_BR, W12SN_LEFT, W12SN_MIN],          // BL
+        [W12SN_TL, W12SN_TR, W12SN_MAX, W12SN_RIGHT],         // TR
+        [W12SN_BL, W12SN_BR, W12SN_RIGHT, W12SN_MIN],         // BR
     ];
-    if !(W12SN_RESTORED..=W12SN_MIN).contains(&state) || !(W12SK_LEFT..=W12SK_DOWN).contains(&key) {
+    if !(W12SN_RESTORED..=W12SN_BR).contains(&state) || !(W12SK_LEFT..=W12SK_DOWN).contains(&key) {
         return W12SN_RESTORED;
     }
     NEXT[state as usize][key as usize]
@@ -390,11 +413,17 @@ pub fn w12_snap_next(state: i32, key: i32) -> i32 {
 /// (`GetWindowRect` dikurangi `DWMWA_EXTENDED_FRAME_BOUNDS`).
 pub fn w12_snap_rect(work: W12RectI, state: i32, frame_inset: W12RectI) -> W12RectI {
     let half = (work.r - work.l) / 2;
+    let half_h = (work.b - work.t) / 2;
     let mut rc = work;
-    if state == W12SN_LEFT {
+    if state == W12SN_LEFT || state == W12SN_TL || state == W12SN_BL {
         rc.r = work.l + half;
-    } else if state == W12SN_RIGHT {
+    } else if state == W12SN_RIGHT || state == W12SN_TR || state == W12SN_BR {
         rc.l = work.l + half;
+    }
+    if state == W12SN_TL || state == W12SN_TR {
+        rc.b = work.t + half_h;
+    } else if state == W12SN_BL || state == W12SN_BR {
+        rc.t = work.t + half_h;
     }
     rc.l -= frame_inset.l;
     rc.t -= frame_inset.t;

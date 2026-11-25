@@ -66,6 +66,10 @@ const KEBAL: &[&str] = &[
     "explorer", "shellexperiencehost", "startmenuexperiencehost", "searchhost", "textinputhost",
     "applicationframehost", "sihost", "ctfmon", "audiodg", "win12shell", "suhuaman",
     "robloxplayerbeta", "minecraft.windows", "powershell", "pwsh", "conhost", "windowsterminal",
+    // Game, launcher, dan anti-cheat (nama exe diperiksa di mesin ini 2026-11-18; vgc untuk Riot Vanguard bila dipasang).
+    // Proses ini tidak boleh kena EcoQoS/prioritas rendah walau sedang di latar (mis. setelah Alt+Tab keluar dari game).
+    "gamelaunchhelper", "robloxcrashhandler", "hyp", "hyphelper", "steam", "steamwebhelper", "prismlauncher",
+    "javaw", "terraria", "wallpaper32", "wallpaper64", "vgc",
 ];
 
 const TEMPLATE_TUGAS: &str = r#"<?xml version="1.0" encoding="UTF-16"?>

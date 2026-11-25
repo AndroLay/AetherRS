@@ -41,7 +41,9 @@ fn index_dan_nama() {
     assert_eq!(w12_stop_index(&[]), -1);
     assert_eq!(w12_stop_name(0), Some("SearchHost.exe"));
     assert_eq!(w12_stop_name(3), Some("ShellExperienceHost.exe"));
-    assert_eq!(w12_stop_name(4), None);
+    assert_eq!(w12_stop_name(4), Some("CrossDeviceResume.exe"));
+    assert_eq!(w12_stop_name(7), Some("SpotifyLauncher.exe"));
+    assert_eq!(w12_stop_name(W12STOP_COUNT as i32), None);
     assert_eq!(w12_stop_name(-1), None);
 }
 

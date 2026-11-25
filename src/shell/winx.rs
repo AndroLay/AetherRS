@@ -87,7 +87,8 @@ fn winx_run(cmd: i32) {
             winx_open("ms-settings:", None);
         }
         WX_EXPLORER => {
-            winx_open("explorer.exe", None);
+            // Sama dengan Win+E: win12files bila ada. explorer.exe langsung dapat menyalakan shell Explorer di mode shell.
+            super::core_c3b::open_folder_window("");
         }
         WX_SEARCH => {
             // Sama dengan Win+S. SAFETY: PostMessageW ke jendela shell dengan WPARAM bilangan bulat biasa.
@@ -212,7 +213,7 @@ pub fn winx_menu(owner: Option<HWND>) {
     winx_sep(m);
     winx_item(m, MF_STRING, WX_TASKMGR as usize, "Pengelola Tugas");
     winx_item(m, MF_STRING, WX_SETTINGS as usize, "Pengaturan");
-    winx_item(m, MF_STRING, WX_EXPLORER as usize, "File Explorer");
+    winx_item(m, MF_STRING, WX_EXPLORER as usize, "Win12 Explorer");
     winx_item(m, MF_STRING, WX_SEARCH as usize, "Cari");
     winx_item(m, MF_STRING, WX_RUN as usize, "Jalankan");
     winx_sep(m);

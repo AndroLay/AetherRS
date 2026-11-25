@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use windows::core::IUnknown_Vtbl;
 use windows::Win32::Storage::Packaging::Appx::{FindPackagesByPackageFamily, GetPackagePathByFullName};
 use windows::Win32::Storage::FileSystem::{DeleteFileW, GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IStream, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IStream, CLSCTX, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
 use windows::Win32::System::Threading::{CreateThread, GetProcessId, OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS, THREAD_CREATION_FLAGS};
 use windows::Win32::UI::Shell::{AssocQueryStringW, ApplicationActivationManager, IApplicationActivationManager, IShellItem, IShellItemArray, SHCreateItemFromParsingName, SHCreateShellItemArrayFromShellItem, SHGetKnownFolderPath, ShellExecuteW, AO_NONE, ASSOCF_IS_PROTOCOL, ASSOCSTR_APPID, FOLDERID_Screenshots, KF_FLAG_CREATE, SIGDN_NORMALDISPLAY};
@@ -85,7 +85,7 @@ fn wide_until_nul(w: &[u16]) -> String {
 
 /// Executable (relatif paket) dari `<Application Id="app_id">` di AppxManifest.xml (HkManifestApp).
 /// Hanya untuk app full trust; None bila bukan full trust atau manifest tidak terbaca.
-fn hk_manifest_app(dir: &str, app_id: &str) -> Option<String> {
+fn hk_manifest_entry(dir: &str, app_id: &str) -> Option<(bool, String)> {
     let text = std::fs::read(format!("{dir}\\AppxManifest.xml")).ok()?;
     if text.is_empty() || text.len() >= 4 * 1024 * 1024 {
         return None;
@@ -112,13 +112,38 @@ fn hk_manifest_app(dir: &str, app_id: &str) -> Option<String> {
             || hk_has(tag, "TrustLevel=\"mediumIL\"")
             || hk_has(tag, "RuntimeBehavior=\"packagedClassicApp\"")
             || hk_has(tag, "RuntimeBehavior=\"win32App\"");
-        return if full_trust && !ex.is_empty() { Some(ex) } else { None };
+        return Some((full_trust, ex));
     }
     None
 }
 
+/// Executable app full trust dari manifest (None = bukan full trust atau tidak ditemukan).
+fn hk_manifest_app(dir: &str, app_id: &str) -> Option<String> {
+    match hk_manifest_entry(dir, app_id) {
+        Some((true, ex)) if !ex.is_empty() => Some(ex),
+        _ => None,
+    }
+}
+
+/// App paket UWP murni (CoreWindow, bukan full trust). App seperti ini tidak bisa tampil saat Explorer bukan
+/// shell (uji 2026-11-18: Kamera, Kalkulator, Pengaturan -> 0x80040900 setelah 45 dtk).
+fn hk_is_uwp(aumid: &str) -> bool {
+    let Some(bang) = aumid.find('!') else {
+        return false;
+    };
+    let Some(dir) = hk_package_dir(&aumid[..bang]) else {
+        return false;
+    };
+    matches!(hk_manifest_entry(&dir, &aumid[bang + 1..]), Some((false, _)))
+}
+
 /// Paket utama keluarga pfn -> folder instalasi -> Executable app (HkPackagedExe).
 fn hk_packaged_exe(pfn: &str, app_id: &str) -> Option<String> {
+    hk_manifest_app(&hk_package_dir(pfn)?, app_id)
+}
+
+/// Folder instalasi paket utama keluarga `pfn`.
+fn hk_package_dir(pfn: &str) -> Option<String> {
     // PACKAGE_FILTER_HEAD | PACKAGE_FILTER_DIRECT
     const FILTER: u32 = 0x10 | 0x20;
     let pw = to_wide_z(pfn);
@@ -153,7 +178,7 @@ fn hk_packaged_exe(pfn: &str, app_id: &str) -> Option<String> {
     if r != ERROR_SUCCESS {
         return None;
     }
-    hk_manifest_app(&wide_until_nul(&dir), app_id)
+    Some(wide_until_nul(&dir))
 }
 
 /// Job peluncuran app paket: aumid "pfn!appid", args, dan target asli (untuk fallback UI).
@@ -168,9 +193,14 @@ struct HkLaunchJob {
 /// Kirim WM_W12_NEEDEXP ke jendela shell. LPARAM = Box<String> mentah; penerima wajib memanggil
 /// `hk_need_explorer(*Box::from_raw(ptr))`. Kontrak ini perubahan terhadap C (C: wchar_t* dari _wcsdup).
 fn hk_post_needexp(target: &str) {
+    hk_post_needexp_kind(target, 0);
+}
+
+/// `kind` 0 = dialog "beralih ke Windows biasa", 1 = Explorer sementara tanpa dialog (hk_temp_explorer).
+fn hk_post_needexp_kind(target: &str, kind: usize) {
     let raw = Box::into_raw(Box::new(target.to_string()));
     // SAFETY: PostMessageW hanya menyalin nilai LPARAM; kepemilikan pindah ke penerima pesan.
-    let posted = unsafe { PostMessageW(Some(MSG.get()), WM_W12_NEEDEXP, WPARAM(0), LPARAM(raw as isize)) };
+    let posted = unsafe { PostMessageW(Some(MSG.get()), WM_W12_NEEDEXP, WPARAM(kind), LPARAM(raw as isize)) };
     if posted.is_err() {
         // SAFETY: pesan gagal dikirim, jadi raw tidak pernah sampai ke penerima.
         drop(unsafe { Box::from_raw(raw) });
@@ -188,7 +218,10 @@ fn hk_activate(job: &HkLaunchJob) -> bool {
     // 1) Paket full trust: DesktopAppXActivator (jalur lama).
     if let Some(exe) = hk_packaged_exe(&job.aumid[..bang], &job.aumid[bang + 1..]) {
         if let Some(ok) = hk_activate_daxa(job, &exe) {
-            return ok;
+            if ok {
+                return true;
+            }
+            log(&format!("aktivasi: DesktopAppxActivator gagal untuk {}, coba ApplicationActivationManager", job.aumid));
         }
     }
     // 2) UWP murni (tanpa exe full trust) atau DesktopAppXActivator tidak tersedia: ApplicationActivationManager.
@@ -221,27 +254,33 @@ fn hk_activate_daxa(job: &HkLaunchJob, exe: &str) -> Option<bool> {
 // PORT: jalur baru (2026-11-14), belum diuji runtime; uji dengan Explorer tidak berjalan.
 // proto true = ActivateForProtocol dengan URI sebagai item shell (ms-settings:<page>); false = ActivateApplication dengan args.
 fn hk_activate_mgr(aumid: &str, arg: &str, proto: bool) -> bool {
+    // 2026-11-18: Kamera (UWP murni) gagal dibuka di mode shell. Contoh resmi memakai CLSCTX_LOCAL_SERVER;
+    // jalur in-proc lama dicoba dulu (paritas), lalu LOCAL_SERVER. Setiap kegagalan dicatat dengan HRESULT.
+    for (ctx, name) in [(CLSCTX_INPROC_SERVER, "inproc"), (CLSCTX_LOCAL_SERVER, "local")] {
+        match hk_activate_mgr_ctx(aumid, arg, proto, ctx) {
+            Ok(()) => return true,
+            Err(e) => log(&format!("aktivasi {name} gagal untuk {aumid}: {e}")),
+        }
+    }
+    false
+}
+
+fn hk_activate_mgr_ctx(aumid: &str, arg: &str, proto: bool, ctx: CLSCTX) -> Result<(), String> {
     let mgr: windows::core::Result<IApplicationActivationManager> =
         // SAFETY: CLSID konstan; objek COM dilepas otomatis saat keluar dari scope.
-        unsafe { CoCreateInstance(&ApplicationActivationManager, None::<&IUnknown>, CLSCTX_INPROC_SERVER) };
-    let Ok(mgr) = mgr else {
-        return false;
-    };
+        unsafe { CoCreateInstance(&ApplicationActivationManager, None::<&IUnknown>, ctx) };
+    let mgr = mgr.map_err(|e| format!("CoCreateInstance 0x{:08X}", e.code().0 as u32))?;
     let aumid_w = to_wide_z(aumid);
     let pid: windows::core::Result<u32> = if proto {
         let uri_w = to_wide_z(arg);
         let item: windows::core::Result<IShellItem> =
             // SAFETY: uri_w berakhir NUL dan hidup selama pemanggilan; bind ctx NULL.
             unsafe { SHCreateItemFromParsingName(pcw(&uri_w), None::<&IBindCtx>) };
-        let Ok(item) = item else {
-            return false;
-        };
+        let item = item.map_err(|e| format!("SHCreateItemFromParsingName 0x{:08X}", e.code().0 as u32))?;
         let arr: windows::core::Result<IShellItemArray> =
             // SAFETY: item hidup selama pemanggilan.
             unsafe { SHCreateShellItemArrayFromShellItem(&item) };
-        let Ok(arr) = arr else {
-            return false;
-        };
+        let arr = arr.map_err(|e| format!("SHCreateShellItemArrayFromShellItem 0x{:08X}", e.code().0 as u32))?;
         // SAFETY: aumid_w berakhir NUL dan hidup selama pemanggilan; arr hidup selama pemanggilan.
         unsafe { mgr.ActivateForProtocol(pcw(&aumid_w), &arr) }
     } else {
@@ -255,9 +294,9 @@ fn hk_activate_mgr(aumid: &str, arg: &str, proto: bool) -> bool {
                 // SAFETY: AllowSetForegroundWindow hanya mengubah izin fokus untuk pid tersebut.
                 let _ = unsafe { AllowSetForegroundWindow(pid) };
             }
-            true
+            Ok(())
         }
-        Err(_) => false,
+        Err(e) => Err(format!("{} 0x{:08X}", if proto { "ActivateForProtocol" } else { "ActivateApplication" }, e.code().0 as u32)),
     }
 }
 
@@ -275,6 +314,13 @@ fn hk_launch_job(job: &HkLaunchJob) -> bool {
 unsafe extern "system" fn hk_launch_thread(p: *mut c_void) -> u32 {
     // SAFETY: p berasal dari Box::into_raw di hk_launch_packaged; thread ini pemilik tunggalnya.
     let job = unsafe { Box::from_raw(p as *mut HkLaunchJob) };
+    // Mode shell + app UWP (termasuk Pengaturan lewat protokol): langsung minta Explorer sementara. Aktivasi
+    // pasti gagal setelah ~45 dtk tanpa Explorer sebagai shell, jadi tidak dicoba.
+    if SHELL_MODE.get() && (job.proto || hk_is_uwp(&job.aumid)) {
+        log(&format!("app UWP {} di mode shell: minta Explorer sementara", job.aumid));
+        hk_post_needexp_kind(&job.orig, 1);
+        return 0;
+    }
     if !hk_launch_job(&job) {
         hk_post_needexp(&job.orig);
     }
@@ -386,6 +432,22 @@ fn shell_exec(verb: Option<&str>, file: &str, params: Option<&str>, dir: Option<
 /// false = ShellExecute biasa.
 fn shell_mode_open(target: &str, args: Option<&str>) -> bool {
     const APPS: &str = "shell:AppsFolder\\";
+    // explorer.exe dan control.exe yang dipanggil tanpa argumen khusus akan menyalakan shell Explorer di mode shell.
+    // Keduanya dialihkan ke win12files (IExplorerBrowser), yang juga bisa menampung Panel Kontrol. Argumen lain
+    // (mis. `explorer /select,...`, `control ncpa.cpl`) tidak diubah.
+    let base = target.rsplit(['\\', '/']).next().unwrap_or(target);
+    let arg = args.map(str::trim).unwrap_or("");
+    if target.eq_ignore_ascii_case("control") || base.eq_ignore_ascii_case("control.exe") {
+        if arg.is_empty() {
+            crate::shell::core_c3b::open_folder_window(CONTROL_PANEL_PATH);
+            return true;
+        }
+    } else if target.eq_ignore_ascii_case("explorer") || base.eq_ignore_ascii_case("explorer.exe") {
+        if arg.is_empty() || (!arg.starts_with('/') && !arg.starts_with('-')) {
+            crate::shell::core_c3b::open_folder_window(arg.trim_matches('"'));
+            return true;
+        }
+    }
     if target.get(..APPS.len()).map_or(false, |p| p.eq_ignore_ascii_case(APPS)) {
         let aumid = &target[APPS.len()..];
         // App Win32 di AppsFolder (tanpa '!') bekerja lewat ShellExecute tanpa Explorer.
@@ -455,6 +517,13 @@ pub fn shell_open_with(target: &str, args: Option<&str>) {
     if target.is_empty() {
         return;
     }
+    // Entri "File Explorer" dari AppsFolder (Start, pencarian, daftar semua aplikasi) selalu membuka
+    // Win12 Explorer, sama seperti pin dok dan Win+E. open_folder_window jatuh ke explorer.exe hanya di luar
+    // mode shell bila win12files.exe tidak ada.
+    if args.is_none() && target.eq_ignore_ascii_case("shell:AppsFolder\\Microsoft.Windows.Explorer") {
+        crate::shell::core_c3b::open_folder_window("");
+        return;
+    }
     if SHELL_MODE.get() && shell_mode_open(target, args) {
         return;
     }
@@ -462,6 +531,9 @@ pub fn shell_open_with(target: &str, args: Option<&str>) {
 }
 
 // ---------------------------------------------------------------- pesan "butuh Explorer" dan peralihan mode
+
+/// Panel Kontrol (tampilan kategori), dibuka di win12files pada mode shell.
+const CONTROL_PANEL_PATH: &str = "shell:::{26EE0668-A00A-44D7-9371-BEB064C98683}";
 
 /// Kunci HKCU untuk pesan peralihan (Software\Win12Shell).
 const WIN12_KEY: &str = "Software\\Win12Shell";
@@ -523,6 +595,18 @@ pub fn hk_need_explorer(target: String) {
     if r == IDYES {
         shell_switch_to_windows(Some(&target));
     }
+}
+
+/// Explorer sementara (2026-11-18, permintaan pengguna): mode shell diserahkan ke Explorer agar app UWP bisa tampil.
+/// win12boot melihat tanda `TempExplorer`, menjalankan Explorer + Win12 biasa, membuka `target`, lalu kembali ke
+/// Win12 penuh setelah tidak ada jendela app UWP lagi.
+pub fn hk_temp_explorer(target: String) {
+    if !SHELL_MODE.get() {
+        shell_open(&target);
+        return;
+    }
+    let _ = crate::reg::set_our_dword("TempExplorer", 1);
+    shell_switch_to_windows(Some(&target));
 }
 
 /// ShellSwitchToWindows: mode shell -> Windows biasa. win12boot melihat kode keluar 0 dan menjalankan Explorer.
@@ -954,55 +1038,68 @@ fn hk_mic_mute() {
 
 /// Win+PrtScn: tulis PNG 32bpp BGRA ke `path`; gagal → file dihapus (sumber HkSavePng, 451–470).
 fn hk_save_png(path: &str, bits: &[u8], w: i32, h: i32) -> bool {
-    let wic_g = WIC.borrow();
-    let Some(wic) = wic_g.as_ref() else {
-        return false;
-    };
     let pw = to_wide_z(path);
-    // SAFETY: pw dan bits hidup sampai pemanggilan selesai; wic dipakai dari thread UI.
-    let ok = unsafe { hk_save_png_com(wic, &pw, bits, w, h) };
-    if !ok {
+    // Faktori WIC milik shell dulu; bila tidak ada atau gagal, faktori baru (2026-11-19: tangkapan hanya masuk
+    // clipboard tanpa jejak penyebab, jadi tiap langkah kini dicatat di boot.log).
+    let shared = WIC.borrow().as_ref().cloned();
+    let mut err = String::from("faktori WIC shell tidak ada");
+    if let Some(wic) = shared {
+        // SAFETY: pw dan bits hidup sampai pemanggilan selesai; wic dipakai dari thread UI.
+        match unsafe { hk_save_png_com(&wic, &pw, bits, w, h) } {
+            Ok(()) => return true,
+            Err(e) => err = e,
+        }
         // SAFETY: pw berakhir NUL dan hidup sampai pemanggilan selesai.
         let _ = unsafe { DeleteFileW(pcw(&pw)) };
     }
-    ok
+    // SAFETY: CoCreateInstance di thread yang sudah memakai COM; hasil dikelola windows-rs.
+    let fresh: windows::core::Result<IWICImagingFactory> = unsafe {
+        windows::Win32::System::Com::CoCreateInstance(
+            &windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory,
+            None,
+            windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+        )
+    };
+    let res = match fresh {
+        // SAFETY: sama seperti di atas.
+        Ok(wic) => unsafe { hk_save_png_com(&wic, &pw, bits, w, h) },
+        Err(e) => Err(format!("CoCreateInstance WIC {:08X}", e.code().0)),
+    };
+    match res {
+        Ok(()) => {
+            crate::log::log(&format!("tangkapan: tersimpan lewat faktori baru ({err})"));
+            true
+        }
+        Err(e2) => {
+            // SAFETY: pw berakhir NUL dan hidup sampai pemanggilan selesai.
+            let _ = unsafe { DeleteFileW(pcw(&pw)) };
+            crate::log::log(&format!("tangkapan: simpan PNG gagal ke {path}: {err}; ulang: {e2}"));
+            false
+        }
+    }
 }
 
-/// Bagian COM dari `hk_save_png`. Mengembalikan false bila salah satu langkah WIC gagal.
-unsafe fn hk_save_png_com(wic: &IWICImagingFactory, path: &[u16], bits: &[u8], w: i32, h: i32) -> bool {
-    let Ok(st) = wic.CreateStream() else {
-        return false;
-    };
-    if st.InitializeFromFilename(pcw(path), GENERIC_WRITE.0).is_err() {
-        return false;
-    }
-    let Ok(enc) = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()) else {
-        return false;
-    };
-    let Ok(stream) = st.cast::<IStream>() else {
-        return false;
-    };
-    if enc.Initialize(&stream, WICBitmapEncoderNoCache).is_err() {
-        return false;
-    }
+/// Bagian COM dari `hk_save_png`. Err berisi langkah WIC yang gagal beserta HRESULT-nya.
+unsafe fn hk_save_png_com(wic: &IWICImagingFactory, path: &[u16], bits: &[u8], w: i32, h: i32) -> Result<(), String> {
+    let hr = |step: &str, e: windows::core::Error| format!("{step} {:08X}", e.code().0);
+    let st = wic.CreateStream().map_err(|e| hr("CreateStream", e))?;
+    st.InitializeFromFilename(pcw(path), GENERIC_WRITE.0).map_err(|e| hr("buka berkas", e))?;
+    let enc = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()).map_err(|e| hr("CreateEncoder", e))?;
+    let stream = st.cast::<IStream>().map_err(|e| hr("IStream", e))?;
+    enc.Initialize(&stream, WICBitmapEncoderNoCache).map_err(|e| hr("enc.Initialize", e))?;
     let mut fr: Option<IWICBitmapFrameEncode> = None;
-    if enc.CreateNewFrame(&mut fr, std::ptr::null_mut()).is_err() {
-        return false;
-    }
-    let Some(fr) = fr else {
-        return false;
-    };
-    if fr.Initialize(None::<&IPropertyBag2>).is_err() || fr.SetSize(w as u32, h as u32).is_err() {
-        return false;
-    }
+    enc.CreateNewFrame(&mut fr, std::ptr::null_mut()).map_err(|e| hr("CreateNewFrame", e))?;
+    let fr = fr.ok_or_else(|| "CreateNewFrame kosong".to_string())?;
+    fr.Initialize(None::<&IPropertyBag2>).map_err(|e| hr("frame.Initialize", e))?;
+    fr.SetSize(w as u32, h as u32).map_err(|e| hr("SetSize", e))?;
     let mut pf = GUID_WICPixelFormat32bppBGRA;
-    if fr.SetPixelFormat(&mut pf).is_err() || pf != GUID_WICPixelFormat32bppBGRA {
-        return false;
+    fr.SetPixelFormat(&mut pf).map_err(|e| hr("SetPixelFormat", e))?;
+    if pf != GUID_WICPixelFormat32bppBGRA {
+        return Err("format piksel ditolak".into());
     }
-    if fr.WritePixels(h as u32, (w * 4) as u32, bits).is_err() {
-        return false;
-    }
-    fr.Commit().is_ok() && enc.Commit().is_ok()
+    fr.WritePixels(h as u32, (w * 4) as u32, bits).map_err(|e| hr("WritePixels", e))?;
+    fr.Commit().map_err(|e| hr("frame.Commit", e))?;
+    enc.Commit().map_err(|e| hr("enc.Commit", e))
 }
 
 /// Win+PrtScn: seluruh layar ke PNG di Gambar\Screenshots dan ke clipboard (CF_DIB) (sumber HkScreenshot, 472–535).
@@ -1166,6 +1263,26 @@ pub fn hk_publish_shot(px: &[u8], w: i32, h: i32) {
         dir = unsafe { from_pcwstr(kf.0) };
         unsafe { CoTaskMemFree(Some(kf.0 as *const c_void)) };
     }
+    if dir.is_empty() {
+        // 2026-11-19: di mode shell SHGetKnownFolderPath(Screenshots/Pictures) gagal, jadi PNG tak pernah tersimpan.
+        // Cadangan: baca lokasi folder langsung dari registri pengguna (RegGetValue mengembangkan %VAR%).
+        let err = unsafe { SHGetKnownFolderPath(&FOLDERID_Screenshots, KF_FLAG_CREATE, None) }
+            .err()
+            .map(|e| format!("{:08X}", e.code().0))
+            .unwrap_or_default();
+        const USF: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders";
+        const SF: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders";
+        const SHOTS: &str = "{B7BEDE81-DF94-4682-A7D8-57A52620B86F}";
+        dir = crate::reg::get_string(USF, SHOTS)
+            .or_else(|| crate::reg::get_string(SF, SHOTS))
+            .or_else(|| crate::reg::get_string(USF, "My Pictures").map(|p| format!("{p}\\Screenshot")))
+            .or_else(|| std::env::var("USERPROFILE").ok().map(|p| format!("{p}\\Pictures\\Screenshots")))
+            .unwrap_or_default();
+        if !dir.is_empty() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        crate::log::log(&format!("tangkapan: FOLDERID_Screenshots gagal ({err}), pakai {dir}"));
+    }
     let mut saved = false;
     if !dir.is_empty() {
         // SAFETY: GetLocalTime tidak punya prasyarat.
@@ -1189,7 +1306,7 @@ pub fn hk_publish_shot(px: &[u8], w: i32, h: i32) {
         }
     }
     if saved {
-        hk_toast("Tangkapan layar disimpan di Gambar\\Screenshots", 0xE722);
+        hk_toast("Tangkapan layar disimpan di Gambar\\Screenshot", 0xE722);
     } else if clip {
         hk_toast("Tangkapan layar disalin ke clipboard", 0xE722);
     } else {

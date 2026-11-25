@@ -320,6 +320,7 @@ pub fn load_settings() {
     TRAY_CLOCK.set(ini_int("shell", "trayclock", 1) != 0);
     WIDGETS.set(ini_int("shell", "widgets", 1) != 0);
     WIN_KEY.set(ini_int("shell", "winkey", 1) != 0);
+    GAME_HOOK.set(ini_int("shell", "gamehook", 1) != 0); // hanya dibaca, tidak ditulis save_settings
     FILES_OWN.set(ini_int("files", "own", 1) != 0);
     // Hanya dibaca (tidak ditulis SaveSettings): tanpa kunci di settings.ini keduanya aktif.
     GLASS.set(ini_int("shell", "glass", 1) != 0);
@@ -328,7 +329,18 @@ pub fn load_settings() {
     // Default 1: HUD notch (media, volume, baterai, pesan) juga tampil saat Explorer masih berjalan.
     // Dulu 0 dan hanya aktif lewat `--shell` (core_c4b.rs:1391), sehingga tidak muncul di mode ini. notchhud=0 untuk mematikan.
     NOTCH_HUD.set(ini_int("shell", "notchhud", 1) != 0);
-    NOTCH_LIVE.set(ini_int("shell", "notchlive", 1) != 0);
+    // 2026-11-15: default 0 = notch auto-hide (permintaan pengguna). Media hanya mengintip 3 dtk saat lagu berganti
+    // atau putar/jeda, lalu hilang; muncul lagi saat kursor ke tepi atas tengah. notchlive=1: pulau media menetap.
+    NOTCH_LIVE.set(ini_int("shell", "notchlive", 0) != 0);
+    // notchalways=1: garis notch tetap terlihat di tepi atas tengah (tidak auto-hide).
+    NOTCH_ALWAYS.set(ini_int("shell", "notchalways", 0) != 0);
+    // notchlyrics=1 (default): lirik tersinkron dari LRCLIB; notchmedtemp=1: pulau media hanya sementara.
+    NOTCH_LYRICS.set(ini_int("shell", "notchlyrics", 1) != 0);
+    NOTCH_MEDIA_TEMP.set(ini_int("shell", "notchmedtemp", 0) != 0);
+    // Default 0: pulau media menampilkan judul dan kontrol. notchcompact=1 untuk kembali ke pulau ringkas tanpa judul.
+    NOTCH_COMPACT.set(ini_int("shell", "notchcompact", 0) != 0);
+    super::state::NOTCH_FS_VIDEO.set(ini_int("shell", "notchfsvideo", 1).clamp(0, 2) as u8);
+    super::state::NOTCH_FS_GAME.set(ini_int("shell", "notchfsgame", 1).clamp(0, 2) as u8);
     let theme = ini_string("shell", "theme", "dark", 16);
     THEME_PREF.set(if theme.eq_ignore_ascii_case("system") {
         0
@@ -1273,7 +1285,7 @@ fn app_from_shell_item(si: &IShellItem, a: &mut App) {
 }
 
 /// `ResolveEntry` (C++ 614–659): satu baris apps.txt menjadi `App` dengan pin = -1. None bila gagal (C: false).
-fn resolve_entry(entry: &str) -> Option<App> {
+pub fn resolve_entry(entry: &str) -> Option<App> {
     let mut a = App { pin: -1, ..App::default() };
     let is_path = entry.contains('\\') || entry.contains('/');
     if !is_path {
@@ -1293,6 +1305,7 @@ fn resolve_entry(entry: &str) -> Option<App> {
                 a.launch = copy_wide(&wf, 600);
                 a.icon_name = copy_wide(&wf, 600);
                 a.exe = copy_wide(&wf, MAX_PATH);
+                a.name = copy_wide("Win12 Explorer", 128);
             } else if a.exe.is_empty() {
                 a.exe = copy_wide(&format!("{}\\explorer.exe", windows_directory()), MAX_PATH);
             }
@@ -1321,6 +1334,20 @@ fn resolve_entry(entry: &str) -> Option<App> {
     }
     a.icon.src = icon_from_parsing_name(&path, src_px());
     a.exe = lower(&a.exe);
+    // Pin berupa jalur explorer.exe (atau pintasannya) diperlakukan sama dengan pin AUMID Explorer: jendela
+    // win12files masuk ke ikon yang sama, dan klik membuka win12files (bukan shell Explorer).
+    let explorer = lower(&format!("{}\\explorer.exe", windows_directory()));
+    if a.exe == explorer && FILES_OWN.get() {
+        let wf = format!("{}\\win12files.exe", DIR.borrow());
+        let wwf = to_wide_z(&wf);
+        // SAFETY: wwf berakhir NUL dan hidup selama pemanggilan.
+        if unsafe { GetFileAttributesW(pcw(&wwf)) } != INVALID_FILE_ATTRIBUTES {
+            a.aumid = copy_wide("Microsoft.Windows.Explorer", 256);
+            a.launch = copy_wide(&wf, 600);
+            a.exe = lower(&wf);
+            a.name = copy_wide("Win12 Explorer", 128);
+        }
+    }
     Some(a)
 }
 
@@ -1571,7 +1598,14 @@ pub fn is_task_window(h: HWND) -> bool {
         )
     };
     if cloaked != 0 {
-        return false;
+        // Frame UWP (Kalkulator, Kamera, Pengaturan) yang ditangguhkan atau diminimalkan dicloak oleh app
+        // sendiri (DWM_CLOAKED_APP = 1) dan tetap layak tampil. Cloak Shell (2, desktop virtual lain),
+        // INHERITED (4), dan kombinasi lain tetap ditolak; jendela non-UWP tetap ditolak seluruhnya.
+        const DWM_CLOAKED_APP: u32 = 1;
+        let uwp_frame = window_class(h) == "ApplicationFrameWindow";
+        if !(uwp_frame && cloaked == DWM_CLOAKED_APP) {
+            return false;
+        }
     }
     if unsafe { GetWindowTextLengthW(h) } == 0 {
         return false;
@@ -1685,6 +1719,14 @@ fn resolve_window(w: &mut WinInfo) {
     }
     w.aumid = aumid;
     w.exe = lower(&exe);
+    // Deploy mengganti nama win12files yang sedang berjalan menjadi "win12files-before-deploy-*.exe";
+    // jendela proses lama itu tetap milik ikon File Explorer (2026-11-19: ikon dok terpisah tanpa ikon).
+    let dir = lower(&DIR.borrow());
+    if let Some(name) = w.exe.strip_prefix(&format!("{}\\", dir)) {
+        if name.starts_with("win12files") && name.ends_with(".exe") && name != "win12files.exe" {
+            w.exe = format!("{}\\win12files.exe", dir);
+        }
+    }
     if !w.aumid.is_empty() {
         w.retry = false;
     }
@@ -2386,6 +2428,16 @@ pub struct MediaState {
     pub artist: [u16; 200],
     pub src: [u16; 256],
     pub art: Icon,
+    /// Nomor sampul dari pekerja GSMTC (media_worker.rs); 0 = tanpa sampul.
+    pub art_seq: u32,
+    /// Garis waktu GSMTC (100 ns). `tl_upd` = LastUpdatedTime (FILETIME UTC).
+    pub tl_start: i64,
+    pub tl_end: i64,
+    pub tl_pos: i64,
+    pub tl_upd: i64,
+    pub can_prev: bool,
+    pub can_next: bool,
+    pub can_seek: bool,
 }
 
 impl MediaState {
@@ -2397,6 +2449,14 @@ impl MediaState {
             artist: [0; 200],
             src: [0; 256],
             art: Icon::new(),
+            art_seq: 0,
+            tl_start: 0,
+            tl_end: 0,
+            tl_pos: 0,
+            tl_upd: 0,
+            can_prev: true,
+            can_next: true,
+            can_seek: false,
         }
     }
 }
@@ -2404,119 +2464,13 @@ impl MediaState {
 /// Status media bersama (C `g_media`), dibaca dan diisi oleh C2.
 pub static MEDIA: SyncCell<RefCell<MediaState>> = SyncCell::new(RefCell::new(MediaState::new()));
 
-/// Bit kejadian yang menunggu diproses (C `g_mediaEvMask`), diisi dari thread event GSMTC.
-static MEDIA_EV_MASK: AtomicI32 = AtomicI32::new(0);
-/// Sesi manager sudah berganti (C `g_mediaSessDirty`).
-static MEDIA_SESS_DIRTY: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-/// Sesi yang event-nya sedang dipasang (C `g_sessEv`).
-static SESS_EV: SyncCell<RefCell<Option<GlobalSystemMediaTransportControlsSession>>> =
-    SyncCell::new(RefCell::new(None));
-/// Token PlaybackInfoChanged dan MediaPropertiesChanged (C `g_tokPlay`, `g_tokProps`).
-static TOK_PLAY: SyncCell<Cell<i64>> = SyncCell::new(Cell::new(0));
-static TOK_PROPS: SyncCell<Cell<i64>> = SyncCell::new(Cell::new(0));
-
-/// Menandai kejadian dari thread event (C `MediaEvHandler::Invoke`). Pesan hanya dikirim bila mask sebelumnya kosong.
-fn media_ev_signal(kind: i32) {
-    let old = MEDIA_EV_MASK.fetch_or(kind, Ordering::SeqCst);
-    if old == 0 {
-        let _ = unsafe { PostMessageW(Some(MSG.get()), WM_W12_MEDIAEV, WPARAM(0), LPARAM(0)) };
-    }
-}
-
-/// Handler PlaybackInfoChanged (C `MediaEvHandler`, kind MEV_PLAY).
-fn play_handler() -> TypedEventHandler<GlobalSystemMediaTransportControlsSession, PlaybackInfoChangedEventArgs> {
-    TypedEventHandler::new(|_, _| {
-        media_ev_signal(MEV_PLAY);
-        Ok(())
-    })
-}
-
-/// Handler MediaPropertiesChanged (C `MediaEvHandler`, kind MEV_PROPS).
-fn props_handler() -> TypedEventHandler<GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs> {
-    TypedEventHandler::new(|_, _| {
-        media_ev_signal(MEV_PROPS);
-        Ok(())
-    })
-}
-
-/// Membandingkan dua objek COM (C `SameObject`) lewat pointer IUnknown.
-fn same_object(a: &GlobalSystemMediaTransportControlsSession, b: &GlobalSystemMediaTransportControlsSession) -> bool {
-    let (Ok(ua), Ok(ub)) = (a.cast::<IUnknown>(), b.cast::<IUnknown>()) else {
-        return false;
-    };
-    ua.as_raw() == ub.as_raw()
-}
-
-/// Melepas event sesi yang sedang dipasang (C `MediaUnhook`).
-pub fn media_unhook() {
-    let old = SESS_EV.borrow_mut().take();
-    if let Some(s) = old {
-        let _ = s.RemovePlaybackInfoChanged(TOK_PLAY.get());
-        let _ = s.RemoveMediaPropertiesChanged(TOK_PROPS.get());
-    }
-}
-
-/// Jatuh ke polling 3 detik bila event tidak bisa dipasang (C `MediaPollFallback`).
-fn media_poll_fallback() {
-    MEDIA_EV.set(false);
-    set_timer(T_MEDIA, 3000);
-}
-
-/// Memasang event pada sesi `s` (C `MediaHook`). Sesi yang sama tidak dipasang ulang kecuali ada tanda sesi berganti.
-pub fn media_hook(s: &GlobalSystemMediaTransportControlsSession) {
-    if !MEDIA_EV.get() {
-        return;
-    }
-    let has_cur = SESS_EV.borrow().is_some();
-    let same = match SESS_EV.borrow().as_ref() {
-        Some(c) => same_object(c, s),
-        None => false,
-    };
-    if has_cur && (!MEDIA_SESS_DIRTY.get() || same) {
-        MEDIA_SESS_DIRTY.set(false);
-        return;
-    }
-    MEDIA_SESS_DIRTY.set(false);
-    media_unhook();
-    let tok_play = match s.PlaybackInfoChanged(&play_handler()) {
-        Ok(t) => t,
-        Err(_) => {
-            media_poll_fallback();
-            return;
-        }
-    };
-    let tok_props = match s.MediaPropertiesChanged(&props_handler()) {
-        Ok(t) => t,
-        Err(_) => {
-            let _ = s.RemovePlaybackInfoChanged(tok_play);
-            media_poll_fallback();
-            return;
-        }
-    };
-    TOK_PLAY.set(tok_play);
-    TOK_PROPS.set(tok_props);
-    *SESS_EV.borrow_mut() = Some(s.clone());
-}
-
-/// Memproses kejadian media tertunda di thread UI (C `MediaEvent`, dipanggil dari WM_W12_MEDIAEV).
+/// Memproses snapshot media di thread UI (C `MediaEvent`, dipanggil dari WM_W12_MEDIAEV).
+/// 2026-11-15: event GSMTC kini ditangani pekerja MTA (media_worker.rs); di sini hanya snapshot diterapkan.
 pub fn media_event() {
-    let k = MEDIA_EV_MASK.swap(0, Ordering::SeqCst);
-    if (k & MEV_SESSION) != 0 {
-        MEDIA_SESS_DIRTY.set(true);
-    }
-    if (k & (MEV_SESSION | MEV_PROPS)) != 0 {
-        MEDIA_WANT.set(true);
-        if MEDIA_EV.get() {
-            set_timer(T_MEDIA, 1500);
-        }
-    }
-    set_timer(T_MEDIA_FAST, 60);
+    super::core_c2::media_apply();
 }
 
 // ---------------------------------------------------------------- Async, HSTRING, thumbnail, dan gambar (C 1284–1328)
-
-/// Pointer fungsi vtable WinRT dengan satu argumen keluaran (`get_Thumbnail`, `OpenReadAsync`, `GetResults`).
-type RawOutFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
 
 /// Mengambil pointer fungsi slot ke-`idx` dari vtable objek COM `this` (slot 0–5 = IUnknown + IInspectable).
 unsafe fn vtbl_slot(this: *mut c_void, idx: usize) -> *const c_void {
@@ -2527,6 +2481,7 @@ unsafe fn vtbl_slot(this: *mut c_void, idx: usize) -> *const c_void {
 /// Status operasi async (C `AsyncStatus`): 0 berjalan, 1 selesai, 2 batal, 3 gagal (default 3).
 /// Tipe `IAsyncInfo` tidak diekspor crate `windows` 0.61 (ada di windows-future), jadi memakai QueryInterface mentah
 /// (IID dari windows-future bindings.rs:1479) lalu slot 7 `get_Status` (urutan slot: IInspectable 0–5, Id 6, Status 7).
+/// Dipakai oleh `qs.rs` (`rad_wait`). Helper lama `async_results` dan `thumb_begin` sudah digantikan `media_worker.rs`.
 pub fn async_status<T: Interface>(op: &T) -> i32 {
     type QueryFn = unsafe extern "system" fn(*mut c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
     type StatusFn = unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT;
@@ -2544,40 +2499,6 @@ pub fn async_status<T: Interface>(op: &T) -> i32 {
             return 3;
         }
         status
-    }
-}
-
-/// Mengambil hasil operasi async yang sudah selesai (C `GetResults`, slot 8 IAsyncOperation). None bila gagal.
-pub fn async_results(op: &windows::core::IInspectable) -> Option<IUnknown> {
-    let mut out: *mut c_void = std::ptr::null_mut();
-    unsafe {
-        let get_results: RawOutFn = std::mem::transmute(vtbl_slot(op.as_raw(), 8));
-        let hr = get_results(op.as_raw(), &mut out);
-        if hr.is_err() || out.is_null() {
-            return None;
-        }
-        Some(IUnknown::from_raw(out))
-    }
-}
-
-/// Membuka aliran thumbnail sebuah properti media (C: `get_Thumbnail` slot 15 IMediaProps, lalu `OpenReadAsync` slot 6 IStreamRef).
-/// Mengembalikan operasi async yang masih berjalan; hasilnya diambil `async_results` setelah `async_status` == 1.
-pub fn thumb_begin<T: Interface>(props: &T) -> Option<windows::core::IInspectable> {
-    let mut sref: *mut c_void = std::ptr::null_mut();
-    let mut op: *mut c_void = std::ptr::null_mut();
-    unsafe {
-        let get_thumb: RawOutFn = std::mem::transmute(vtbl_slot(props.as_raw(), 15));
-        let hr = get_thumb(props.as_raw(), &mut sref);
-        if hr.is_err() || sref.is_null() {
-            return None;
-        }
-        let sref = windows::core::IInspectable::from_raw(sref);
-        let open: RawOutFn = std::mem::transmute(vtbl_slot(sref.as_raw(), 6));
-        let hr = open(sref.as_raw(), &mut op);
-        if hr.is_err() || op.is_null() {
-            return None;
-        }
-        Some(windows::core::IInspectable::from_raw(op))
     }
 }
 
@@ -2606,12 +2527,24 @@ pub fn wstr_eq(a: &[u16], b: &[u16]) -> bool {
 
 /// Mendekode thumbnail dari aliran `ras` menjadi bitmap persegi `size` x `size` (C `DecodeArt`). None bila gagal atau sisi nol.
 pub fn decode_art(ras: &IUnknown, size: i32) -> Option<IWICBitmapSource> {
+    // SAFETY: ras adalah IRandomAccessStream yang valid; hasilnya IStream milik kita.
+    let stream: IStream = unsafe { CreateStreamOverRandomAccessStream(ras).ok()? };
+    decode_art_stream(&stream, size)
+}
+
+/// Mendekode sampul dari byte PNG/JPEG (dibaca pekerja GSMTC, media_worker.rs).
+pub fn decode_art_bytes(bytes: &[u8], size: i32) -> Option<IWICBitmapSource> {
+    // SAFETY: SHCreateMemStream menyalin `bytes` ke aliran memori baru.
+    let stream: IStream = unsafe { windows::Win32::UI::Shell::SHCreateMemStream(Some(bytes))? };
+    decode_art_stream(&stream, size)
+}
+
+fn decode_art_stream(stream: &IStream, size: i32) -> Option<IWICBitmapSource> {
     let wic_ref = WIC.borrow();
     let factory = wic_ref.as_ref()?;
     unsafe {
-        let stream: IStream = CreateStreamOverRandomAccessStream(ras).ok()?;
         let decoder: IWICBitmapDecoder = factory
-            .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+            .CreateDecoderFromStream(stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
             .ok()?;
         let frame: IWICBitmapFrameDecode = decoder.GetFrame(0).ok()?;
         let (mut w, mut h) = (0u32, 0u32);

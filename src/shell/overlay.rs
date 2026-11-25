@@ -34,6 +34,110 @@ struct OvItem {
     th: isize,
     asp: f32,
     title: [u16; 128],
+    /// Grup snap (Alt+Tab, 2026-11-19): jumlah anggota (0 = jendela tunggal). Anggota 0 = `h`.
+    gn: u8,
+    gh: [HWND; 4],
+    /// Fraksi area tiap anggota di dalam area thumbnail (kiri, atas, kanan, bawah).
+    gf: [[f32; 4]; 4],
+    /// Thumbnail DWM anggota 1..3 (anggota 0 memakai `th`).
+    gth: [isize; 4],
+}
+
+fn ov_item_new(w: HWND) -> OvItem {
+    let mut title = [0u16; 128];
+    unsafe { GetWindowTextW(w, &mut title) };
+    OvItem {
+        h: w,
+        app: ov_app_of(w),
+        card: RECT::default(),
+        thumb: RECT::default(),
+        th: 0,
+        asp: ov_aspect(w),
+        title,
+        gn: 0,
+        gh: [HWND(std::ptr::null_mut()); 4],
+        gf: [[0.0; 4]; 4],
+        gth: [0; 4],
+    }
+}
+
+/// Alt+Tab: gabungkan jendela satu grup snap menjadi satu kartu (posisi kartu = anggota terbaru di urutan Z).
+fn sw_group_items() {
+    // Urutan kartu = urutan Z; borrow dilepas sebelum snap_groups memanggil Win32.
+    let zorder: Vec<HWND> = OV_ITEMS.borrow().iter().filter(|it| it.gn == 0).map(|it| it.h).collect();
+    let groups = super::snap::snap_groups(&zorder);
+    if groups.is_empty() {
+        return;
+    }
+    let mut items = OV_ITEMS.borrow_mut();
+    for g in groups {
+        let pos: Vec<usize> = g.iter().filter_map(|(h, _)| items.iter().position(|it| it.h == *h && it.gn == 0)).collect();
+        if pos.len() < 2 {
+            continue;
+        }
+        let first = *pos.iter().min().unwrap_or(&0);
+        let mut it = items[first];
+        it.gn = 0;
+        // Anggota: jendela kartu terdepan dulu, lalu sisanya.
+        let mut members: Vec<(HWND, [f32; 4])> = g.iter().filter(|(h, _)| items.iter().any(|x| x.h == *h)).cloned().collect();
+        if let Some(k) = members.iter().position(|(h, _)| *h == it.h) {
+            let m = members.remove(k);
+            members.insert(0, m);
+        }
+        for (k, (h, f)) in members.iter().take(4).enumerate() {
+            it.gh[k] = *h;
+            it.gf[k] = *f;
+            it.gn += 1;
+        }
+        // Rasio kartu = rasio area kerja monitor.
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if unsafe { GetMonitorInfoW(MonitorFromWindow(it.h, MONITOR_DEFAULTTONEAREST), &mut mi) }.as_bool() {
+            let w = (mi.rcWork.right - mi.rcWork.left) as f32;
+            let h = (mi.rcWork.bottom - mi.rcWork.top) as f32;
+            if w > 0.0 && h > 0.0 {
+                it.asp = (w / h).clamp(0.6, 2.4);
+            }
+        }
+        items[first] = it;
+        let gh = it.gh;
+        let n = it.gn as usize;
+        let mut k = 0;
+        let mut gone = Vec::new();
+        items.retain(|x| {
+            let keep = k == first || x.gn > 0 || !gh[..n].contains(&x.h);
+            if !keep {
+                gone.push(*x);
+            }
+            k += 1;
+            keep
+        });
+        SW_MEMBERS.borrow_mut().extend(gone);
+    }
+}
+
+/// Item anggota grup yang kartunya digabung (untuk ikon dan nama). Dikosongkan `ov_close`.
+static SW_MEMBERS: SyncCell<RefCell<Vec<OvItem>>> = SyncCell::new(RefCell::new(Vec::new()));
+
+/// Item anggota `k` dari kartu grup `it` (anggota 0 = kartu itu sendiri).
+fn sw_member(it: &OvItem, k: usize) -> OvItem {
+    if k == 0 {
+        return *it;
+    }
+    SW_MEMBERS.borrow().iter().find(|m| m.h == it.gh[k]).copied().unwrap_or_else(|| ov_item_new(it.gh[k]))
+}
+
+/// Rect anggota `k` grup di dalam area thumbnail kartu (dengan celah kecil seperti Windows).
+fn sw_member_rect(it: &OvItem, k: usize) -> RECT {
+    let t = it.thumb;
+    let (w, h) = ((t.right - t.left) as f32, (t.bottom - t.top) as f32);
+    let f = it.gf[k];
+    let gap = s(2.0);
+    RECT {
+        left: t.left + (w * f[0]) as i32 + if f[0] > 0.0 { gap } else { 0 },
+        top: t.top + (h * f[1]) as i32 + if f[1] > 0.0 { gap } else { 0 },
+        right: t.left + (w * f[2]) as i32 - if f[2] < 1.0 { gap } else { 0 },
+        bottom: t.top + (h * f[3]) as i32 - if f[3] < 1.0 { gap } else { 0 },
+    }
 }
 
 // Pengganti g_ov* (state Alt+Tab / Task View). Semua privat ke modul ini.
@@ -182,6 +286,12 @@ fn ov_unthumb() {
                 let _ = unsafe { DwmUnregisterThumbnail(it.th) };
                 it.th = 0;
             }
+            for t in it.gth.iter_mut() {
+                if *t != 0 {
+                    let _ = unsafe { DwmUnregisterThumbnail(*t) };
+                    *t = 0;
+                }
+            }
         }
     }
     let mut dk = OV_DK_TH.borrow_mut();
@@ -200,17 +310,7 @@ fn ov_collect() {
     let mut w = unsafe { GetTopWindow(None) }.unwrap_or_default();
     while !w.0.is_null() && v.len() < OV_ITEM_MAX {
         if is_task_window(w) {
-            let mut title = [0u16; 128];
-            unsafe { GetWindowTextW(w, &mut title) };
-            v.push(OvItem {
-                h: w,
-                app: ov_app_of(w),
-                card: RECT::default(),
-                thumb: RECT::default(),
-                th: 0,
-                asp: ov_aspect(w),
-                title,
-            });
+            v.push(ov_item_new(w));
         }
         w = unsafe { GetWindow(w, GW_HWNDNEXT) }.unwrap_or_default();
     }
@@ -313,11 +413,31 @@ fn ov_thumbs() {
     }
     let n = OV_ITEMS.borrow().len();
     for i in 0..n {
-        let (h, thumb, mut th_i) = {
+        let (h, thumb, mut th_i, grp) = {
             let items = OV_ITEMS.borrow();
             let it = &items[i];
-            (it.h, it.thumb, it.th)
+            (it.h, it.thumb, it.th, if it.gn > 0 { Some(*it) } else { None })
         };
+        // Kartu grup snap: satu thumbnail per anggota, di posisi snap-nya.
+        if let Some(it) = grp {
+            for k in 0..it.gn as usize {
+                let mut t = if k == 0 { it.th } else { it.gth[k] };
+                if t == 0 {
+                    match unsafe { DwmRegisterThumbnail(th, it.gh[k]) } {
+                        Ok(v) => t = v,
+                        Err(_) => continue,
+                    }
+                    let mut items = OV_ITEMS.borrow_mut();
+                    if k == 0 {
+                        items[i].th = t;
+                    } else {
+                        items[i].gth[k] = t;
+                    }
+                }
+                ov_thumb_props(t, sw_member_rect(&it, k), None, true, true);
+            }
+            continue;
+        }
         // Task View: jendela diminimalkan tetap ikon besar (digambar OvRender).
         // Alt+Tab: jendela diminimalkan juga diberi thumbnail DWM seperti Windows (bisa kosong bila app tidak menyimpan frame).
         if OV_MODE.get() != OV_SWITCH && unsafe { IsIconic(h) }.as_bool() {
@@ -673,6 +793,7 @@ fn ov_close() {
     }
     OV_MODE.set(OV_NONE);
     OV_ITEMS.borrow_mut().clear();
+    SW_MEMBERS.borrow_mut().clear();
     OV_SHOWN.set(false);
     OV_TRACK.set(false);
     OV_HOT.set(-1);
@@ -801,7 +922,10 @@ fn sw_step(dir: i32, kb: bool) {
     }
     if mode != OV_SWITCH {
         // Per jendela (seperti Windows): setiap jendela tugas punya kartu sendiri, termasuk jendela tanpa aplikasi.
+        // Jendela satu grup snap (Win+panah) digabung menjadi satu kartu, seperti Windows 11.
         ov_collect();
+        SW_MEMBERS.borrow_mut().clear();
+        sw_group_items();
         let n = OV_ITEMS.borrow().len() as i32;
         if n == 0 {
             at_reset_sticky(); // Ctrl+Alt+Tab tanpa jendela: tidak ada panel, jangan tinggalkan mode tetap
@@ -1067,18 +1191,42 @@ fn at_reset_sticky() {
     }
 }
 
+/// Letakkan `others` berurutan tepat di bawah `target` (urutan Z), tanpa mengaktifkan. Aman dipanggil dari
+/// thread mana pun; jendela yang sudah tertutup atau diminimalkan dilewati.
+fn sw_restack(target: HWND, others: &[HWND]) {
+    let mut after = target;
+    for &g in others {
+        unsafe {
+            if !IsWindow(Some(g)).as_bool() || IsIconic(g).as_bool() {
+                continue;
+            }
+            let _ = SetWindowPos(g, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+        after = g;
+    }
+}
+
 /// `SwCommit`: aktifkan pilihan. `alt_vk` != 0 = Alt yang ditahan kait harus dilepas (lihat komentar C).
 fn sw_commit(alt_vk: usize) {
     let mode = OV_MODE.get();
     let sel = OV_SEL.get();
-    let target = {
+    let (target, group) = {
         let items = OV_ITEMS.borrow();
         if mode == OV_SWITCH && sel >= 0 && (sel as usize) < items.len() {
-            items[sel as usize].h
+            let it = items[sel as usize];
+            (it.h, it.gh[..it.gn as usize].to_vec())
         } else {
-            ov_null()
+            (ov_null(), Vec::new())
         }
     };
+    // Kartu grup snap: semua anggota naik ke depan bersama (seperti Windows 11); anggota terdepan diaktifkan.
+    for &g in group.iter().skip(1).rev() {
+        if unsafe { IsWindow(Some(g)) }.as_bool() {
+            unsafe {
+                let _ = SetWindowPos(g, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
     if mode == OV_SWITCH {
         ov_close();
     }
@@ -1088,6 +1236,26 @@ fn sw_commit(alt_vk: usize) {
     unsafe { SendInput(&pad, std::mem::size_of::<INPUT>() as i32) };
     if !target.0.is_null() && unsafe { IsWindow(Some(target)) }.as_bool() {
         activate_window(target);
+        // 2026-11-23: aktivasi lintas proses berjalan asinkron dan bisa menimpa urutan di atas, sehingga
+        // sering hanya satu anggota yang naik. Tumpuk ulang anggota tepat di bawah target sekarang dan
+        // sesudah aktivasi selesai.
+        if group.len() > 1 {
+            sw_restack(target, &group[1..]);
+            let t = target.0 as isize;
+            let rest: Vec<isize> = group[1..].iter().map(|g| g.0 as isize).collect();
+            std::thread::spawn(move || {
+                for ms in [60u64, 180, 400] {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    let th = HWND(t as *mut std::ffi::c_void);
+                    // Berhenti bila pengguna sudah pindah ke jendela lain.
+                    if unsafe { GetForegroundWindow() } != th {
+                        break;
+                    }
+                    let others: Vec<HWND> = rest.iter().map(|&g| HWND(g as *mut std::ffi::c_void)).collect();
+                    sw_restack(th, &others);
+                }
+            });
+        }
     }
     if alt_vk != 0 {
         let ext = if alt_vk == VK_RMENU.0 as usize {
@@ -1169,13 +1337,15 @@ fn sw_layout(mw: f32, mh: f32) -> (f32, f32) {
 /// Alpha thumbnail DWM Alt+Tab (0–255), mengikuti fade panel. Hanya kartu yang punya thumbnail.
 fn sw_thumb_alpha(a: u8) {
     for it in OV_ITEMS.borrow().iter() {
-        if it.th != 0 {
-            let p = DWM_THUMBNAIL_PROPERTIES {
-                dwFlags: DWM_TNP_OPACITY,
-                opacity: a,
-                ..Default::default()
-            };
-            let _ = unsafe { DwmUpdateThumbnailProperties(it.th, &p) };
+        let p = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_OPACITY,
+            opacity: a,
+            ..Default::default()
+        };
+        for t in std::iter::once(it.th).chain(it.gth.iter().copied()) {
+            if t != 0 {
+                let _ = unsafe { DwmUpdateThumbnailProperties(t, &p) };
+            }
         }
     }
 }
@@ -1233,6 +1403,7 @@ fn sw_load_icons() {
     let want: Vec<(String, String, HWND)> = OV_ITEMS
         .borrow()
         .iter()
+        .chain(SW_MEMBERS.borrow().iter())
         .map(|it| {
             let (key, exe) = sw_icon_key(it);
             (key, exe, it.h)
@@ -1378,14 +1549,47 @@ fn ov_render_switch() {
         let tr = it.thumb;
         let (tl, tt) = (tr.left as f32, tr.top as f32);
         let (tx, tb) = (tr.right as f32, tr.bottom as f32);
-        // Pita judul: ikon kecil di kiri, judul di kanannya (tengah vertikal, lihat `text`).
+        // Pita judul: ikon kecil di kiri, judul di kanannya (tengah vertikal, lihat `text`), tombol X di ujung kanan
+        // saat kartu disorot/dipilih. Kartu grup snap: pita dibagi per anggota (ikon + nama + X masing-masing).
         let iy = t + (tt - t - head_isz) / 2.0;
-        sw_draw_item_icon(&it, tl, iy, head_isz);
-        let name = sw_name(&it);
-        text(&name, TF_S.borrow().as_ref(), tl + head_isz + sf(SW_TEXT_GAP0), t, tx, tt, c.text, 1.0);
+        let show_x = i as i32 == sel || i as i32 == hot_i;
+        let xs = sw_x_rects(&it);
+        let n_seg = (it.gn as usize).max(1);
+        let seg_w = (r - l) / n_seg as f32;
+        for k in 0..n_seg {
+            let m = if it.gn > 0 { sw_member(&it, k) } else { it };
+            let sx = if it.gn > 0 { l + seg_w * k as f32 + sf(6.0) } else { tl };
+            let xr = xs[k.min(xs.len() - 1)].1;
+            let right = if show_x { xr.left as f32 - sf(4.0) } else if it.gn > 0 { l + seg_w * (k + 1) as f32 - sf(4.0) } else { tx };
+            sw_draw_item_icon(&m, sx, iy, head_isz);
+            let name = sw_name(&m);
+            text(&name, TF_S.borrow().as_ref(), sx + head_isz + sf(SW_TEXT_GAP0), t, right, tt, c.text, 1.0);
+            if show_x {
+                let hx = i as i32 == hot_i && OV_HOT_X.get() && OV_HOT_M.get() == k as i32;
+                if hx {
+                    fill_rr(xr.left as f32, xr.top as f32, xr.right as f32, xr.bottom as f32, sf(5.0), rgba(196, 43, 28, 1.0), 1.0);
+                }
+                let gc = if hx { rgba(255, 255, 255, 1.0) } else { c.text };
+                glyph(
+                    0xE711,
+                    TF_GLYPH_SM.borrow().as_ref(),
+                    (xr.left + xr.right) as f32 / 2.0,
+                    (xr.top + xr.bottom) as f32 / 2.0,
+                    sf(10.0),
+                    gc,
+                    1.0,
+                );
+            }
+        }
         // Area thumbnail: placeholder; thumbnail DWM menutupinya bila ada.
         fill_rr(tl, tt, tx, tb, trad, thumb_bg, 1.0);
-        if it.th == 0 {
+        if it.gn > 0 {
+            // Kartu grup: kotak placeholder per anggota (thumbnail DWM tiap anggota digambar di atasnya).
+            for k in 0..it.gn as usize {
+                let mr = sw_member_rect(&it, k);
+                fill_rr(mr.left as f32, mr.top as f32, mr.right as f32, mr.bottom as f32, sf(4.0), thumb_bg, 1.0);
+            }
+        } else if it.th == 0 {
             // Tanpa thumbnail (diminimalkan): ikon besar di tengah area.
             let cx = (tl + tx) / 2.0 - big_isz / 2.0;
             let cy = (tt + tb) / 2.0 - big_isz / 2.0;
@@ -1547,11 +1751,147 @@ fn ov_hit_item(x: i32, y: i32) -> (i32, bool) {
         if !ov_pt_in(&it.card, x, y) {
             continue;
         }
+        if OV_MODE.get() == OV_SWITCH {
+            let hit = sw_x_rects(it).into_iter().find(|(_, r)| ov_pt_in(r, x, y)).map(|(k, _)| k as i32);
+            OV_HOT_M.set(hit.unwrap_or(-1));
+            return (i as i32, hit.is_some());
+        }
         let xr = ov_close_rect(&it.card);
         let on_x = OV_MODE.get() == OV_TV && ov_pt_in(&xr, x, y);
         return (i as i32, on_x);
     }
+    OV_HOT_M.set(-1);
     (-1, false)
+}
+
+/// Anggota grup di bawah tombol X Alt+Tab (-1 = tidak ada); `OV_HOT_M_DRAWN` = nilai saat terakhir digambar.
+static OV_HOT_M: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(-1));
+static OV_HOT_M_DRAWN: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(-1));
+
+/// Tombol X Alt+Tab di ujung kanan pita judul kartu (2026-11-19, permintaan pengguna). Kartu grup: pita dibagi
+/// per anggota, tiap anggota punya X sendiri.
+fn sw_x_rects(it: &OvItem) -> Vec<(usize, RECT)> {
+    let c = it.card;
+    let top = c.top + s(5.0);
+    let bot = (it.thumb.top - s(3.0)).max(top + s(16.0));
+    let sz = (bot - top).min(s(26.0));
+    let n = (it.gn as i32).max(1);
+    let seg = (c.right - c.left) / n;
+    (0..n)
+        .map(|k| {
+            let right = c.left + seg * (k + 1) - s(4.0);
+            let mid = (top + bot) / 2;
+            (k as usize, ov_rc(right - sz, mid - sz / 2, right, mid + sz / 2))
+        })
+        .collect()
+}
+
+/// Tutup jendela (anggota `k` dari kartu `i`) dari Alt+Tab tanpa menutup panel; kartu lain disusun ulang.
+fn sw_close_member(i: i32, k: i32) {
+    let Some(it) = OV_ITEMS.borrow().get(i.max(0) as usize).copied() else { return };
+    let k = k.max(0) as usize;
+    let h = if it.gn > 0 { it.gh[k.min(it.gn as usize - 1)] } else { it.h };
+    unsafe {
+        let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    // Lepas thumbnail kartu ini; kartu baru dibuat dari anggota yang tersisa.
+    for t in std::iter::once(it.th).chain(it.gth.iter().copied()) {
+        if t != 0 {
+            let _ = unsafe { DwmUnregisterThumbnail(t) };
+        }
+    }
+    let rest: Vec<HWND> = if it.gn > 0 { it.gh[..it.gn as usize].iter().copied().filter(|x| *x != h).collect() } else { Vec::new() };
+    {
+        let mut items = OV_ITEMS.borrow_mut();
+        let idx = i as usize;
+        if rest.len() >= 2 {
+            let mut g = items[idx];
+            let mut n = 0usize;
+            let (oh, of) = (g.gh, g.gf);
+            g.gh = [HWND(std::ptr::null_mut()); 4];
+            g.gth = [0; 4];
+            g.th = 0;
+            for m in 0..it.gn as usize {
+                if oh[m] != h {
+                    g.gh[n] = oh[m];
+                    g.gf[n] = of[m];
+                    n += 1;
+                }
+            }
+            g.gn = n as u8;
+            let first = g.gh[0];
+            g.h = first;
+            if let Some(mm) = SW_MEMBERS.borrow().iter().find(|m| m.h == first) {
+                g.title = mm.title;
+                g.app = mm.app;
+            }
+            items[idx] = g;
+        } else if rest.len() == 1 {
+            items[idx] = SW_MEMBERS.borrow().iter().find(|m| m.h == rest[0]).copied().unwrap_or_else(|| ov_item_new(rest[0]));
+            items[idx].th = 0;
+        } else {
+            items.remove(idx);
+        }
+    }
+    let n = OV_ITEMS.borrow().len() as i32;
+    if n == 0 {
+        ov_close();
+        at_reset_sticky();
+        at_reset_active();
+        return;
+    }
+    if OV_SEL.get() >= n {
+        OV_SEL.set(n - 1);
+    }
+    OV_HOT.set(-1);
+    OV_HOT_M.set(-1);
+    sw_relayout();
+}
+
+/// Susun ulang panel Alt+Tab yang sedang tampil (setelah kartu ditutup).
+fn sw_relayout() {
+    let ui = OV_UI.get();
+    let th = OV_TH.get();
+    let Some(first) = OV_ITEMS.borrow().first().map(|it| it.h) else { return };
+    // Thumbnail lama dilepas; posisi kartu berubah.
+    {
+        let mut items = OV_ITEMS.borrow_mut();
+        for it in items.iter_mut() {
+            for t in std::iter::once(&mut it.th).chain(it.gth.iter_mut()) {
+                if *t != 0 {
+                    let _ = unsafe { DwmUnregisterThumbnail(*t) };
+                    *t = 0;
+                }
+            }
+        }
+    }
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        let _ = GetMonitorInfoW(MonitorFromWindow(first, MONITOR_DEFAULTTOPRIMARY), &mut mi);
+    }
+    let m = mi.rcMonitor;
+    let (mw, mh) = ((m.right - m.left) as f32, (m.bottom - m.top) as f32);
+    let (bw, bh) = sw_layout(mw, mh);
+    let left = m.left + ((mw - bw) / 2.0) as i32;
+    let top = m.top + ((mh - bh) / 2.0) as i32;
+    let old = OV_RC.get();
+    let rc = ov_rc(left, top, left + bw.round() as i32, top + bh.round() as i32);
+    OV_RC.set(rc);
+    if old.right - old.left != rc.right - rc.left || old.bottom - old.top != rc.bottom - rc.top {
+        // Blur lama tidak cocok lagi ukurannya; panel memakai warna buram tanpa blur.
+        SW_BLUR.borrow_mut().clear();
+    }
+    if !th.0.is_null() {
+        unsafe {
+            let _ = SetWindowPos(th, Some(HWND_TOPMOST), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOACTIVATE);
+        }
+    }
+    if ui.0.is_null() {
+        return;
+    }
+    ov_render();
+    ov_thumbs();
+    sw_thumb_alpha(SW_ALPHA.get());
 }
 
 /// `OvHitDesk`: indeks kartu desktop (0..=VD_MAX) di titik (x, y) dan apakah titik di tombol X.
@@ -1648,7 +1988,13 @@ fn ov_mouse(m: u32, x: i32, y: i32) {
             };
             OV_TRACK.set(unsafe { TrackMouseEvent(&mut t) }.is_ok());
         }
-        if hi != OV_HOT.get() || ix != OV_HOT_X.get() || hd != OV_DK_HOT.get() || dx != OV_DK_HOT_X.get() {
+        if hi != OV_HOT.get()
+            || ix != OV_HOT_X.get()
+            || hd != OV_DK_HOT.get()
+            || dx != OV_DK_HOT_X.get()
+            || OV_HOT_M.get() != OV_HOT_M_DRAWN.get()
+        {
+            OV_HOT_M_DRAWN.set(OV_HOT_M.get());
             OV_HOT.set(hi);
             OV_HOT_X.set(ix);
             OV_DK_HOT.set(hd);
@@ -1664,6 +2010,10 @@ fn ov_mouse(m: u32, x: i32, y: i32) {
     }
     if m == WM_LBUTTONUP {
         if OV_MODE.get() == OV_SWITCH {
+            if hi >= 0 && ix {
+                sw_close_member(hi, OV_HOT_M.get());
+                return;
+            }
             if hi >= 0 {
                 OV_SEL.set(hi);
                 at_reset_active();
@@ -2336,6 +2686,17 @@ pub fn tasks_key(k: &KBDLLHOOKSTRUCT, wp: usize, win_down: bool) -> i32 {
         }
     }
     let mut st = AT_STATE.get();
+    // Pulihkan status Alt bila pelepasan Alt terlewat (mis. Alt+Tab terbuka lalu kunci layar),
+    // supaya tombol berikutnya tidak tertelan dan panel tidak tertinggal terbuka.
+    if (st.state == 1 || st.state == 2)
+        && !w12_is_alt_vk(vk)
+        && unsafe { GetAsyncKeyState(0x12) } >= 0
+    {
+        if st.state == 1 {
+            tk_post(TK_SW_CANCEL, 0);
+        }
+        st.state = 0;
+    }
     let alt_vk = st.alt_vk; // dibaca dulu: w12_alt_tab_key mereset state saat COMMIT
     let a = w12_alt_tab_key(&mut st, vk, down, alt, shift, ctrl);
     AT_STATE.set(st);

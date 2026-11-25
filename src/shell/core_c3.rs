@@ -422,11 +422,40 @@ pub fn send_keys(k1: u16, k2: u16, k3: u16) {
     }
 }
 
+/// Jendela app yang diminimalkan dari dok dalam keadaan maksimal. Dipulihkan dengan `SW_MAXIMIZE` agar tidak
+/// kembali ke ukuran normal. Entri dihapus saat `activate_window` memulihkannya atau saat `EVENT_SYSTEM_MINIMIZEEND`.
+static DOCK_MIN_ZOOMED: SyncCell<RefCell<Vec<HWND>>> = SyncCell::new(RefCell::new(Vec::new()));
+
+/// Minimalkan jendela dari dok. Bila sedang maksimal, catat dulu agar pemulihan kembali maksimal.
+pub fn minimize_dock_window(h: HWND) {
+    unsafe {
+        if IsZoomed(h).as_bool() {
+            let mut v = DOCK_MIN_ZOOMED.borrow_mut();
+            v.retain(|&w| w != h && IsWindow(Some(w)).as_bool());
+            if v.len() >= 32 {
+                v.remove(0);
+            }
+            v.push(h);
+        }
+        let _ = ShowWindowAsync(h, SW_MINIMIZE);
+    }
+}
+
+/// Hapus catatan maksimal untuk `h`; mengembalikan true bila catatan itu ada.
+pub fn take_dock_zoomed(h: HWND) -> bool {
+    let mut v = DOCK_MIN_ZOOMED.borrow_mut();
+    let before = v.len();
+    v.retain(|&w| w != h);
+    v.len() != before
+}
+
 /// Sumber: `ActivateWindow` (:2791). Memulihkan jendela yang diminimalkan, lalu memaksa fokus.
 pub fn activate_window(h: HWND) {
     unsafe {
         if IsIconic(h).as_bool() {
-            let _ = ShowWindowAsync(h, SW_RESTORE);
+            // Maksimal sebelum diminimalkan dari dok: pulihkan maksimal, bukan ukuran normal.
+            let cmd = if take_dock_zoomed(h) { SW_MAXIMIZE } else { SW_RESTORE };
+            let _ = ShowWindowAsync(h, cmd);
         }
         if !SetForegroundWindow(h).as_bool() || GetForegroundWindow() != h {
             SwitchToThisWindow(h, true);
@@ -478,9 +507,7 @@ pub fn click_app(ai: i32, new_instance: bool) {
     let cur = wins.iter().rposition(|&w| w == fg);
     if wins.len() == 1 {
         if cur == Some(0) {
-            unsafe {
-                let _ = ShowWindowAsync(fg, SW_MINIMIZE);
-            }
+            minimize_dock_window(fg);
         } else {
             activate_window(wins[0]);
         }
@@ -513,6 +540,9 @@ pub fn focus_media_source() {
     };
     match target {
         Some(h) => activate_window(h),
+        // 2026-11-15: jendela sumber tidak dikenal dok (mis. Spotify Store di tray): buka lewat AUMID-nya.
+        // Sebelumnya fallback ini menekan putar/jeda, sehingga klik sampul justru menjeda lagu.
+        None if !src.is_empty() => shell_open(&format!("shell:AppsFolder\\{}", src)),
         None => media_cmd(1, "dok"),
     }
 }
@@ -697,13 +727,16 @@ pub fn restore_native_taskbar() {
     if orig < 0 {
         return;
     }
-    if !tray.0.is_null() {
-        let mut ab = new_appbar(tray);
-        let flag: u32 = if orig != 0 { ABS_AUTOHIDE } else { ABS_ALWAYSONTOP };
-        ab.lParam = LPARAM(flag as isize);
-        unsafe {
-            SHAppBarMessage(ABM_SETSTATE, &mut ab);
-        }
+    // Nilai asli hanya dihapus setelah diterapkan ke taskbar. Bila taskbar belum ada (Explorer belum jalan),
+    // nilai tetap disimpan agar tidak hilang dan dipakai restore berikutnya (dimuat ulang dari ini di core_c1.rs:342).
+    if tray.0.is_null() {
+        return;
+    }
+    let mut ab = new_appbar(tray);
+    let flag: u32 = if orig != 0 { ABS_AUTOHIDE } else { ABS_ALWAYSONTOP };
+    ab.lParam = LPARAM(flag as isize);
+    unsafe {
+        SHAppBarMessage(ABM_SETSTATE, &mut ab);
     }
     ORIG_AUTO_HIDE.set(-1);
     let _ = ini_delete("state", "OrigAutoHide");
@@ -927,9 +960,189 @@ pub unsafe extern "system" fn tray_host_proc(h: HWND, m: u32, wp: WPARAM, lp: LP
                 return LRESULT(1);
             }
         }
+        // K1/K2 (2026-11-18): tanpa Explorer (mode shell), Win12 sendiri yang menjawab pesan AppBar (dwData 0,
+        // SHAppBarMessage) dan posisi ikon tray (dwData 3, Shell_NotifyIconGetRect). Dengan Explorer hidup, jawabannya
+        // tetap dari Explorer (diteruskan di atas).
+        if !fwd {
+            if cds.dwData == 0 {
+                return LRESULT(compat_appbar(cds));
+            }
+            if cds.dwData == 3 {
+                return LRESULT(compat_icon_rect(cds));
+            }
+        }
         return LRESULT(if fwd { r as isize } else { 0 });
     }
     DefWindowProcW(h, m, wp, lp)
+}
+
+// ---------------------------------------------------------------- K1/K2: layanan Shell_TrayWnd tanpa Explorer
+
+/// APPBARDATA versi tetap 32/64-bit yang dikirim shell32 di dalam WM_COPYDATA (handle 32-bit, lParam 32-bit + pad).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AppBarData3264 {
+    cb_size: u32,
+    hwnd: u32,
+    cb_msg: u32,
+    edge: u32,
+    rc: RECT,
+    lparam: u32,
+    pad: u32,
+}
+
+/// Bungkus pesan AppBar: data, kode ABM_*, handle memori bersama (diisi balik untuk ABM_GETTASKBARPOS), PID pengirim.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AppBarMsg3264 {
+    abd: AppBarData3264,
+    msg: u32,
+    pad1: u32,
+    shared: u64,
+    src_pid: u32,
+    pad3: u32,
+}
+
+/// Bit per jenis pesan yang sudah dicatat sekali ke log (diagnosis tanpa membanjiri boot.log).
+static COMPAT_LOGGED: SyncCell<Cell<u64>> = SyncCell::new(Cell::new(0));
+
+fn compat_log_once(bit: u32, msg: &str) {
+    let m = COMPAT_LOGGED.get();
+    if bit < 64 && m & (1u64 << bit) == 0 {
+        COMPAT_LOGGED.set(m | (1u64 << bit));
+        log(msg);
+    }
+}
+
+/// Daerah "taskbar" Win12: pita di bawah area kerja layar utama. Bila area kerja tidak dikurangi bilah, pita
+/// setinggi 48 px (diskalakan) di tepi bawah.
+fn compat_taskbar_rect() -> RECT {
+    let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let mut wa = RECT::default();
+    // SAFETY: wa adalah RECT yang ditulis SystemParametersInfoW.
+    let ok = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+            windows::Win32::UI::WindowsAndMessaging::SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as *mut c_void),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok();
+    let top = if ok && wa.bottom > 0 && wa.bottom < sh { wa.bottom } else { sh - s(48.0) };
+    RECT { left: 0, top, right: sw, bottom: sh }
+}
+
+/// Jawaban SHAppBarMessage. Nilai kembali = hasil SHAppBarMessage di aplikasi pengirim.
+unsafe fn compat_appbar(cds: &COPYDATASTRUCT) -> isize {
+    if cds.lpData.is_null() || (cds.cbData as usize) < std::mem::size_of::<AppBarMsg3264>() {
+        compat_log_once(63, &format!("appbar: ukuran data tak dikenal ({} B), diabaikan", cds.cbData));
+        return 0;
+    }
+    let am: AppBarMsg3264 = std::ptr::read_unaligned(cds.lpData as *const AppBarMsg3264);
+    compat_log_once(am.msg.min(40), &format!("appbar: pesan ABM {} dari pid {} dijawab Win12", am.msg, am.src_pid));
+    match am.msg {
+        // ABM_GETSTATE: selalu di atas, tidak sembunyi otomatis (bilah Win12 memakan area kerja).
+        4 => 2,
+        // ABM_GETTASKBARPOS: tulis rect dan tepi ke memori bersama milik pengirim.
+        5 => {
+            if am.shared == 0 {
+                return 0;
+            }
+            let hs = HANDLE(am.shared as usize as *mut c_void);
+            let pv = windows::Win32::UI::Shell::SHLockShared(hs, am.src_pid);
+            if pv.is_null() {
+                return 0;
+            }
+            let mut abd: AppBarData3264 = std::ptr::read_unaligned(pv as *const AppBarData3264);
+            abd.rc = compat_taskbar_rect();
+            abd.edge = 3; // ABE_BOTTOM
+            std::ptr::write_unaligned(pv as *mut AppBarData3264, abd);
+            let _ = windows::Win32::UI::Shell::SHUnlockShared(pv);
+            1
+        }
+        // ABM_GETAUTOHIDEBAR / ABM_GETAUTOHIDEBAREX: tidak ada bilah sembunyi otomatis.
+        7 | 11 => 0,
+        // ABM_SETAUTOHIDEBAR / EX: ditolak (Win12 tidak mengelola bilah sembunyi otomatis pihak ketiga).
+        8 | 12 => 0,
+        // ABM_NEW, REMOVE, QUERYPOS, SETPOS, ACTIVATE, WINDOWPOSCHANGED, SETSTATE: diterima. Posisi yang diminta
+        // dibiarkan apa adanya (area kerja tidak dikurangi untuk bilah pihak ketiga).
+        0 | 1 | 2 | 3 | 6 | 9 | 10 => 1,
+        _ => 0,
+    }
+}
+
+/// Rect layar ikon tray: sel di flyout bila flyout terbuka, selain itu tombol chevron (^) di bilah.
+fn compat_tray_icon_screen_rect(idx: usize) -> Option<RECT> {
+    if FLY_OPEN.get() {
+        let map = FLY_MAP.borrow();
+        if let Some(k) = map.iter().position(|&i| i == idx) {
+            let cell = s(40.0);
+            let pad = s(8.0);
+            let cols = FLY_COLS.get().max(1) as usize;
+            let fr = FLY_RECT.get();
+            let l = fr.left + pad + (k % cols) as i32 * cell;
+            let t = fr.top + pad + (k / cols) as i32 * cell;
+            return Some(RECT { left: l, top: t, right: l + cell, bottom: t + cell });
+        }
+    }
+    let items = ITEMS.borrow();
+    let pills = PILLS.borrow();
+    let it = items.iter().find(|it| it.ty == IT_CHEV)?;
+    let p = pills.get(it.pill as usize)?;
+    if !p.shown {
+        return None;
+    }
+    let l = p.x + it.x as i32;
+    Some(RECT { left: l, top: p.y, right: l + it.w as i32, bottom: p.y + p.ht })
+}
+
+/// Jawaban Shell_NotifyIconGetRect. Pesan 1 = MAKELONG(kiri, atas), pesan 2 = MAKELONG(kanan, bawah); 0 = gagal.
+unsafe fn compat_icon_rect(cds: &COPYDATASTRUCT) -> isize {
+    let n = cds.cbData as usize;
+    if cds.lpData.is_null() || n < 40 {
+        return 0;
+    }
+    let p = cds.lpData as *const u8;
+    if std::ptr::read_unaligned(p as *const u32) != 0x3475_3423 {
+        return 0;
+    }
+    let which = std::ptr::read_unaligned(p.add(4) as *const u32);
+    // Tata letak: magic, pesan, cbSize, pad, lalu hWnd. hWnd 32-bit (40 B) atau 64-bit (48 B).
+    let (hwnd, uid, guid) = if n >= 48 {
+        (
+            std::ptr::read_unaligned(p.add(16) as *const u64) as usize,
+            std::ptr::read_unaligned(p.add(24) as *const u32),
+            std::ptr::read_unaligned(p.add(28) as *const GUID),
+        )
+    } else {
+        (
+            std::ptr::read_unaligned(p.add(16) as *const u32) as usize,
+            std::ptr::read_unaligned(p.add(20) as *const u32),
+            std::ptr::read_unaligned(p.add(24) as *const GUID),
+        )
+    };
+    compat_log_once(41, &format!("ikon tray: permintaan posisi ({} B) dijawab Win12", n));
+    let idx = {
+        let v = TRAY_ICONS.borrow();
+        let has_guid = guid != GUID::zeroed();
+        v.iter().position(|t| {
+            if has_guid {
+                t.has_guid && t.guid == guid
+            } else {
+                t.hwnd.0 as usize as u32 == hwnd as u32 && t.uid == uid
+            }
+        })
+    };
+    let Some(idx) = idx else { return 0 };
+    let Some(r) = compat_tray_icon_screen_rect(idx) else { return 0 };
+    let pack = |x: i32, y: i32| ((x as u32 & 0xFFFF) | ((y as u32 & 0xFFFF) << 16)) as isize;
+    match which {
+        1 => pack(r.left, r.top),
+        2 => pack(r.right, r.bottom),
+        _ => 0,
+    }
 }
 
 /// Sumber: `TrayHostCreate` (win12shell.cpp:3043). Jendela penerima Shell_NotifyIcon milik Win12.
@@ -1549,6 +1762,11 @@ fn zoom_refit_apply(old: RECT, new: RECT, list: &[ZoomRefit]) {
     }
 }
 
+/// Rect AppBar terakhir yang dikirim (SETPOS ulang dengan rect sama dilewati agar ABN_POSCHANGED tidak berantai).
+static AB_LAST_RC: SyncCell<Cell<RECT>> = SyncCell::new(Cell::new(RECT { left: 0, top: 0, right: 0, bottom: 0 }));
+/// (awal jendela waktu, jumlah perubahan, jeda sampai) untuk pengaman loop area kerja.
+static WA_GUARD: SyncCell<Cell<(u64, u32, u64)>> = SyncCell::new(Cell::new((0, 0, 0)));
+
 /// Mode shell: tidak ada pengelola appbar Explorer, jadi area kerja layar utama diatur langsung.
 /// Tidak menyiarkan bila tidak berubah: WM_SETTINGCHANGE memicu Relayout.
 /// Sumber: `ShellWorkArea` (win12shell.cpp:3290).
@@ -1571,6 +1789,22 @@ pub(crate) fn shell_work_area(reserve: bool) {
     .is_ok();
     if got && unsafe { EqualRect(&cur, &r) }.as_bool() {
         return;
+    }
+    // Pengaman loop: bila pihak lain terus mengubah area kerja, berhenti memaksa selama 10 dtk (cegah jendela
+    // maksimal berubah ukuran berulang-ulang).
+    {
+        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+        let (t0, n, until) = WA_GUARD.get();
+        if now < until {
+            return;
+        }
+        let (t0, n) = if now.saturating_sub(t0) > 3000 { (now, 0u32) } else { (t0, n) };
+        if n >= 4 {
+            WA_GUARD.set((now, 0, now + 10_000));
+            crate::log::log("area kerja: diubah pihak lain berulang kali, Win12 berhenti memaksa selama 10 dtk");
+            return;
+        }
+        WA_GUARD.set((t0, n + 1, 0));
     }
     // Catat jendela maksimal SEBELUM area berubah: Windows kadang sudah menggesernya saat area mengecil,
     // jadi rect lama harus diambil dari sini, bukan dari GetWindowRect sesudahnya.
@@ -1601,21 +1835,38 @@ pub(crate) fn app_bar_set_pos() {
         return;
     }
     if !AB_REG.get() {
+        // PORT: tanpa AppBar terdaftar dok tetap tampil; area kerja dicadangkan lewat SPI agar maksimal tidak menutupinya.
+        shell_work_area(true);
         return;
     }
+    // 2026-11-15: area kerja diatur HANYA lewat AppBar selama Explorer berjalan (Explorer menimpa SPI_SETWORKAREA).
+    // Terukur sebelumnya: QUERYPOS menggeser rect 36 px ke atas (bottom 1164), AppBar memberi area 1092 sementara SPI
+    // memaksa 1128, sehingga keduanya bolak-balik dan jendela maksimal terus berubah ukuran. Sekarang geseran itu
+    // dikompensasi: rect diperpendek sebesar geseran agar puncaknya tetap di sh - reserve.
+    let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let reserve = reserve_h();
     let mut ab = APPBARDATA {
         cbSize: std::mem::size_of::<APPBARDATA>() as u32,
         hWnd: MSG.get(),
         uEdge: ABE_BOTTOM,
+        rc: RECT { left: 0, top: sh - reserve, right: sw, bottom: sh },
         ..Default::default()
     };
-    let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let reserve = reserve_h();
-    ab.rc = RECT { left: 0, top: sh - reserve, right: sw, bottom: sh };
     unsafe { SHAppBarMessage(ABM_QUERYPOS, &mut ab) };
-    ab.rc.top = ab.rc.bottom - reserve;
+    let shift = (sh - ab.rc.bottom).clamp(0, reserve - 1);
+    let want = RECT { left: 0, top: sh - reserve, right: sw, bottom: sh - shift };
+    let last = AB_LAST_RC.get();
+    if unsafe { EqualRect(&last, &want) }.as_bool() {
+        return;
+    }
+    ab.rc = want;
     unsafe { SHAppBarMessage(ABM_SETPOS, &mut ab) };
+    AB_LAST_RC.set(want);
+    crate::log::log(&format!(
+        "AppBar: SETPOS top={} bottom={} (geser Explorer {} px, hasil top={})",
+        want.top, want.bottom, shift, ab.rc.top
+    ));
 }
 
 /// Sumber: `AppBarRegister` (win12shell.cpp:3314).
@@ -1633,6 +1884,8 @@ pub fn app_bar_register() {
         };
         let ok = unsafe { SHAppBarMessage(ABM_NEW, &mut ab) } != 0;
         AB_REG.set(ok);
+        AB_LAST_RC.set(RECT::default());
+        crate::log::log(&format!("AppBar: ABM_NEW ok={}", ok));
     }
     app_bar_set_pos();
 }
@@ -1643,15 +1896,17 @@ pub fn app_bar_remove() {
         shell_work_area(false);
         return;
     }
-    if !AB_REG.get() {
-        return;
+    if AB_REG.get() {
+        let mut ab = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            hWnd: MSG.get(),
+            ..Default::default()
+        };
+        unsafe { SHAppBarMessage(ABM_REMOVE, &mut ab) };
+        AB_REG.set(false);
+        AB_LAST_RC.set(RECT::default());
     }
-    let mut ab = APPBARDATA {
-        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-        hWnd: MSG.get(),
-        ..Default::default()
-    };
-    unsafe { SHAppBarMessage(ABM_REMOVE, &mut ab) };
-    AB_REG.set(false);
+    // PORT: area kerja mungkin dicadangkan lewat SPI_SETWORKAREA (app_bar_set_pos); kembalikan saat keluar.
+    shell_work_area(false);
 }
 

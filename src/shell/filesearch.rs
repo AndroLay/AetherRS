@@ -2,7 +2,7 @@
 use super::prelude::*;
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use windows::core::{HRESULT, PCWSTR, PWSTR};
@@ -105,33 +105,55 @@ const fn fs_null() -> HANDLE {
     HANDLE(std::ptr::null_mut())
 }
 
+/// Pembungkus `Box<FsWatch>` agar bisa disimpan di `Mutex` lintas thread (UI membuat/menutup saat thread berhenti,
+/// thread pembangun memantau saat hidup).
+struct SendWatch(Box<FsWatch>);
+
+// SAFETY: FsWatch hanya diakses secara eksklusif di bawah FS_WATCH Mutex; handle Win32 & OVERLAPPED aman dipindah antar thread.
+unsafe impl Send for SendWatch {}
+
+struct FsQueryState {
+    q: String,
+    cap: i32,
+}
+
+struct FsConfig {
+    idx_path: String,
+    new_path: String,
+    recent_dir: String,
+    profile: String,
+    roots: Vec<String>,
+}
+
 // ---- Global (`static` di :43-64) ----
-// Nilai Copy memakai Cell; String/Vec/COM memakai RefCell (rencana-sisa.md).
+// Global UI-only memakai SyncCell; global yang diakses thread pekerja memakai Mutex / Atomic.
 // FS_GEN, FS_RUNNING, FS_MAXHITS, FS_PATH, WM_W12_FXHITS, dan MSG sudah ada di state.rs: tidak dideklarasikan ulang.
 pub static FS_RES: SyncCell<Cell<*mut FsResult>> = SyncCell::new(Cell::new(std::ptr::null_mut()));
-/// Critical section (`g_fsCs`): melindungi FS_GEN, FS_Q, dan FS_QCAP.
-static FS_CS: Mutex<()> = Mutex::new(());
-static FS_Q: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
-static FS_QCAP: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(8));
+/// Critical section (`g_fsCs`): melindungi FS_GEN, kueri (`q`), dan kapasitas (`cap`).
+static FS_QUERY: Mutex<FsQueryState> = Mutex::new(FsQueryState {
+    q: String::new(),
+    cap: 8,
+});
 static FS_THREADS: SyncCell<Cell<[HANDLE; 2]>> = SyncCell::new(Cell::new([fs_null(), fs_null()]));
-static FS_QUIT: SyncCell<Cell<HANDLE>> = SyncCell::new(Cell::new(fs_null()));
-static FS_QUERY_EV: SyncCell<Cell<HANDLE>> = SyncCell::new(Cell::new(fs_null()));
+static FS_QUIT: crate::sync::AtomicHandle<HANDLE> = crate::sync::AtomicHandle::null();
+static FS_QUERY_EV: crate::sync::AtomicHandle<HANDLE> = crate::sync::AtomicHandle::null();
 static FS_CANCEL: AtomicI32 = AtomicI32::new(0);
 static FS_SWAP: AtomicI32 = AtomicI32::new(0);
 static FS_HAVE_VIEW: AtomicI32 = AtomicI32::new(0);
 static FS_BUILDING: AtomicI32 = AtomicI32::new(0);
-static FS_IDX_PATH: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
-static FS_NEW_PATH: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
-static FS_RECENT_DIR: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
-static FS_PROFILE: SyncCell<RefCell<String>> = SyncCell::new(RefCell::new(String::new()));
-/// Akar pemindaian (`g_fsRootBuf` + `g_fsRoots` + `g_fsNRoots`).
-static FS_ROOTS: SyncCell<RefCell<Vec<String>>> = SyncCell::new(RefCell::new(Vec::new()));
-static FS_WATCH: SyncCell<RefCell<Vec<Box<FsWatch>>>> = SyncCell::new(RefCell::new(Vec::new()));
-/// Hanya thread pembangun (FsInitDue dipanggil sebelum thread berjalan).
-static FS_DIRTY: SyncCell<Cell<bool>> = SyncCell::new(Cell::new(false));
-static FS_FIRST_CHG: SyncCell<Cell<u64>> = SyncCell::new(Cell::new(0));
-static FS_DUE_AT: SyncCell<Cell<u64>> = SyncCell::new(Cell::new(0));
-/// Slot ikon (`g_fsIcon`, `g_fsIconUsed`, `g_fsIconKey`, `g_fsIconPx`). Diisi saat FsStart.
+static FS_CFG: Mutex<FsConfig> = Mutex::new(FsConfig {
+    idx_path: String::new(),
+    new_path: String::new(),
+    recent_dir: String::new(),
+    profile: String::new(),
+    roots: Vec::new(),
+});
+static FS_WATCH: Mutex<Vec<SendWatch>> = Mutex::new(Vec::new());
+/// Jatuh tempo pembangunan indeks (diinisialisasi sebelum thread berjalan, lalu dipakai thread pembangun).
+static FS_DIRTY: crate::sync::AtomicFlag = crate::sync::AtomicFlag::new(false);
+static FS_FIRST_CHG: AtomicU64 = AtomicU64::new(0);
+static FS_DUE_AT: AtomicU64 = AtomicU64::new(0);
+/// Slot ikon (`g_fsIcon`, `g_fsIconUsed`, `g_fsIconKey`, `g_fsIconPx`). Diisi saat FsStart (UI-only).
 static FS_ICON: SyncCell<RefCell<Vec<Icon>>> = SyncCell::new(RefCell::new(Vec::new()));
 static FS_ICON_USED: SyncCell<RefCell<Vec<bool>>> = SyncCell::new(RefCell::new(Vec::new()));
 static FS_ICON_KEY: SyncCell<RefCell<Vec<String>>> = SyncCell::new(RefCell::new(Vec::new()));
@@ -140,16 +162,16 @@ static FS_ICON_PX: SyncCell<Cell<i32>> = SyncCell::new(Cell::new(0));
 // ---- Pembantu global ----
 
 /// Kunci critical section (`EnterCriticalSection` g_fsCs). Racun (poison) diabaikan agar tidak panik.
-fn fs_cs() -> MutexGuard<'static, ()> {
-    FS_CS.lock().unwrap_or_else(|e| e.into_inner())
+fn fs_query_lock() -> MutexGuard<'static, FsQueryState> {
+    FS_QUERY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn fs_get(cell: &SyncCell<RefCell<String>>) -> String {
-    cell.borrow().clone()
+fn fs_cfg_lock() -> MutexGuard<'static, FsConfig> {
+    FS_CFG.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn fs_set(cell: &SyncCell<RefCell<String>>, s: String) {
-    *cell.borrow_mut() = s;
+fn fs_watch_lock() -> MutexGuard<'static, Vec<SendWatch>> {
+    FS_WATCH.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---- Waktu, path, lingkungan (:66-106) ----
@@ -314,13 +336,13 @@ fn fs_watch_open(w: &mut FsWatch, path: &str, subtree: bool) -> bool {
 /// bangun setelah FS_STARTBUILD_MS. Selain itu dianggap segar.
 fn fs_init_due() {
     let now = fs_now_ms();
-    let idx = fs_get(&FS_IDX_PATH);
+    let idx = fs_cfg_lock().idx_path.clone();
     // Setara GetFileAttributesExW: waktu tulis terakhir berkas indeks.
     let mtime = std::fs::metadata(&idx).ok().and_then(|m| m.modified().ok());
     let Some(mtime) = mtime else {
         FS_DIRTY.set(true);
-        FS_FIRST_CHG.set(now);
-        FS_DUE_AT.set(now);
+        FS_FIRST_CHG.store(now, Ordering::Relaxed);
+        FS_DUE_AT.store(now, Ordering::Relaxed);
         return;
     };
     // Waktu tulis di masa depan dihitung usia 0, seperti `nowFt > ft ? ... : 0` di C++.
@@ -330,8 +352,8 @@ fn fs_init_due() {
         .unwrap_or(0);
     if age_ms > FS_OLDIDX_MS {
         FS_DIRTY.set(true);
-        FS_FIRST_CHG.set(now);
-        FS_DUE_AT.set(now + FS_STARTBUILD_MS);
+        FS_FIRST_CHG.store(now, Ordering::Relaxed);
+        FS_DUE_AT.store(now + FS_STARTBUILD_MS, Ordering::Relaxed);
     } else {
         FS_DIRTY.set(false);
     }
@@ -341,11 +363,11 @@ fn fs_init_due() {
 fn fs_mark_dirty(now: u64) {
     if !FS_DIRTY.get() {
         FS_DIRTY.set(true);
-        FS_FIRST_CHG.set(now);
+        FS_FIRST_CHG.store(now, Ordering::Relaxed);
     }
     let quiet = now + FS_QUIET_MS;
-    let cap = FS_FIRST_CHG.get() + FS_MAXDELAY_MS;
-    FS_DUE_AT.set(quiet.min(cap));
+    let cap = FS_FIRST_CHG.load(Ordering::Relaxed) + FS_MAXDELAY_MS;
+    FS_DUE_AT.store(quiet.min(cap), Ordering::Relaxed);
 }
 
 /// Pengganti HasOverlappedIoCompleted (makro winbase.h): Internal != STATUS_PENDING (0x103).
@@ -356,9 +378,9 @@ fn fs_overlapped_done(ov: &OVERLAPPED) -> bool {
 /// Memeriksa pemantau yang sudah selesai (`FsPollWatchers`, :195). Tiap perubahan menandai indeks kotor,
 /// lalu pemantau dipasang ulang.
 fn fs_poll_watchers() {
-    let mut watches = FS_WATCH.borrow_mut();
+    let mut watches = fs_watch_lock();
     for slot in watches.iter_mut() {
-        let w: &mut FsWatch = slot;
+        let w: &mut FsWatch = &mut slot.0;
         if !w.armed || w.dir.0.is_null() {
             continue;
         }
@@ -404,11 +426,12 @@ fn fs_build_index() {
     FS_DIRTY.set(false);
     FS_BUILDING.store(1, Ordering::SeqCst);
     let mut st = W12FxBuildStats::default();
-    let roots = FS_ROOTS.borrow().clone();
+    let (roots, recent, new_path) = {
+        let cfg = fs_cfg_lock();
+        (cfg.roots.clone(), cfg.recent_dir.clone(), cfg.new_path.clone())
+    };
     let refs: Vec<Option<&str>> = roots.iter().map(|s| Some(s.as_str())).collect();
-    let recent = fs_get(&FS_RECENT_DIR);
     let recent_opt = (!recent.is_empty()).then_some(recent.as_str());
-    let new_path = fs_get(&FS_NEW_PATH);
     let ok = w12_fx_build(&refs, recent_opt, &new_path, Some(&FS_CANCEL), Some(&mut st));
     FS_BUILDING.store(0, Ordering::SeqCst);
     if ok {
@@ -419,8 +442,8 @@ fn fs_build_index() {
         // Gagal (bukan dibatalkan): coba lagi nanti.
         let now = fs_now_ms();
         FS_DIRTY.set(true);
-        FS_FIRST_CHG.set(now);
-        FS_DUE_AT.set(now + FS_RETRY_MS);
+        FS_FIRST_CHG.store(now, Ordering::Relaxed);
+        FS_DUE_AT.store(now + FS_RETRY_MS, Ordering::Relaxed);
     }
 }
 
@@ -436,22 +459,22 @@ unsafe extern "system" fn fs_build_thread(_param: *mut c_void) -> u32 {
             break;
         }
         let now = fs_now_ms();
-        if FS_DIRTY.get() && now >= FS_DUE_AT.get() {
+        if FS_DIRTY.get() && now >= FS_DUE_AT.load(Ordering::Relaxed) {
             fs_build_index();
             continue;
         }
-        // Susun daftar handel tanpa memegang borrow FS_WATCH saat menunggu. Indeks 0 selalu quit.
+        // Susun daftar handel tanpa memegang kunci FS_WATCH saat menunggu. Indeks 0 selalu quit.
         let mut hs: Vec<HANDLE> = vec![quit];
         {
-            let watches = FS_WATCH.borrow();
+            let watches = fs_watch_lock();
             for slot in watches.iter() {
-                if slot.armed && !slot.dir.0.is_null() {
-                    hs.push(slot.ov.hEvent);
+                if slot.0.armed && !slot.0.dir.0.is_null() {
+                    hs.push(slot.0.ov.hEvent);
                 }
             }
         }
         let wait = if FS_DIRTY.get() {
-            FS_DUE_AT.get().wrapping_sub(now) as u32
+            FS_DUE_AT.load(Ordering::Relaxed).wrapping_sub(now) as u32
         } else {
             INFINITE
         };
@@ -487,10 +510,10 @@ pub fn fs_query(q: &str, cap: i32) {
     }
     let cap = cap.clamp(1, FS_MAXHITS);
     {
-        let _cs = fs_cs();
+        let mut qs = fs_query_lock();
         FS_GEN.set(FS_GEN.get() + 1);
-        fs_set(&FS_Q, fs_trunc16(q, FS_MAXQ));
-        FS_QCAP.set(cap);
+        qs.q = fs_trunc16(q, FS_MAXQ);
+        qs.cap = cap;
     }
     if q.is_empty() {
         fs_clear_hits();
@@ -516,8 +539,9 @@ fn fs_init_paths() -> bool {
     let _ = std::fs::create_dir(&dir); // gagal bila sudah ada: diabaikan
     match (fs_cat(&dir, "\\files.idx"), fs_cat(&dir, "\\files.idx.new")) {
         (Some(idx), Some(new)) => {
-            fs_set(&FS_IDX_PATH, idx);
-            fs_set(&FS_NEW_PATH, new);
+            let mut cfg = fs_cfg_lock();
+            cfg.idx_path = idx;
+            cfg.new_path = new;
             true
         }
         _ => false,
@@ -562,12 +586,14 @@ fn fs_roots() {
     }
     let n = w12_fx_dedupe_roots(&mut roots);
     roots.truncate(n);
-    *FS_ROOTS.borrow_mut() = roots;
-    fs_set(&FS_PROFILE, fs_env("USERPROFILE").unwrap_or_default());
+    let profile = fs_env("USERPROFILE").unwrap_or_default();
     let recent = fs_env("APPDATA")
         .and_then(|ad| fs_cat(&ad, "\\Microsoft\\Windows\\Recent"))
         .unwrap_or_default();
-    fs_set(&FS_RECENT_DIR, recent);
+    let mut cfg = fs_cfg_lock();
+    cfg.roots = roots;
+    cfg.profile = profile;
+    cfg.recent_dir = recent;
 }
 
 /// Menyiapkan 33 slot ikon bila belum ada. C++ memakai global nol; di Rust slot dibuat saat start.
@@ -622,18 +648,20 @@ pub fn fs_start() {
     }
     fs_icon_ensure();
     {
-        let mut watches = FS_WATCH.borrow_mut();
+        let (roots, recent) = {
+            let cfg = fs_cfg_lock();
+            (cfg.roots.clone(), cfg.recent_dir.clone())
+        };
+        let mut watches = fs_watch_lock();
         if watches.len() != FS_MAXWATCH {
             watches.clear();
-            watches.resize_with(FS_MAXWATCH, || Box::new(FsWatch::zeroed()));
+            watches.resize_with(FS_MAXWATCH, || SendWatch(Box::new(FsWatch::zeroed())));
         }
-        let roots = FS_ROOTS.borrow();
         for (i, root) in roots.iter().enumerate() {
-            fs_watch_open(&mut watches[i], root, true);
+            fs_watch_open(&mut watches[i].0, root, true);
         }
-        let recent = fs_get(&FS_RECENT_DIR);
         if !recent.is_empty() {
-            fs_watch_open(&mut watches[FS_RECENT_IDX], &recent, false);
+            fs_watch_open(&mut watches[FS_RECENT_IDX].0, &recent, false);
         }
     }
     fs_init_due();
@@ -665,7 +693,7 @@ pub fn fs_stop() {
         let _ = unsafe { SetEvent(quit) };
     }
     {
-        let _cs = fs_cs();
+        let _cs = fs_query_lock();
         FS_GEN.set(FS_GEN.get() + 1); // hasil yang masih terbang menjadi basi
     }
     let threads = FS_THREADS.get();
@@ -689,9 +717,9 @@ pub fn fs_stop() {
     }
     FS_THREADS.set([fs_null(); 2]);
     {
-        let mut watches = FS_WATCH.borrow_mut();
+        let mut watches = fs_watch_lock();
         for slot in watches.iter_mut() {
-            fs_watch_close(slot);
+            fs_watch_close(&mut slot.0);
         }
     }
     let qev = FS_QUERY_EV.get();
@@ -784,7 +812,7 @@ fn fs_same_name(v: &W12FxView, a: u32, b: u32) -> bool {
 
 /// FsBuildHits (:418): menyusun baris hasil untuk UI (nama, subjudul, jalur, flags).
 fn fs_build_hits(v: &W12FxView, h: &[W12SearchHit], res: &mut FsResult) {
-    let profile = fs_get(&FS_PROFILE);
+    let profile = fs_cfg_lock().profile.clone();
     for (row, hit) in h.iter().enumerate() {
         let idx = hit.reference as u32;
         let e = fs_entry(v, idx);
@@ -889,7 +917,7 @@ fn fs_search_once(v: &W12FxView, q: &str, cap: i32, gen: i32) {
     r.n = n as i32;
     fs_build_hits(v, &tmp[..n], r);
     let fresh = {
-        let _cs = fs_cs();
+        let _cs = fs_query_lock();
         FS_GEN.get() == gen
     };
     let posted = if fresh {
@@ -909,7 +937,10 @@ fn fs_search_once(v: &W12FxView, q: &str, cap: i32, gen: i32) {
 /// Thread pencari (`FsSearchThread`, :505): membuka indeks, menukarnya bila pembangun sudah siap,
 /// lalu menjawab kueri terbaru. Keluar saat FS_QUIT diset (atau WAIT gagal).
 unsafe extern "system" fn fs_search_thread(_param: *mut c_void) -> u32 {
-    let idx = fs_get(&FS_IDX_PATH);
+    let (idx, new_path_str) = {
+        let cfg = fs_cfg_lock();
+        (cfg.idx_path.clone(), cfg.new_path.clone())
+    };
     let mut v = fs_view_empty();
     let mut open = w12_fx_open(&idx, &mut v);
     FS_HAVE_VIEW.store(i32::from(open), Ordering::SeqCst);
@@ -925,7 +956,7 @@ unsafe extern "system" fn fs_search_thread(_param: *mut c_void) -> u32 {
                 w12_fx_close(&mut v);
             }
             FS_HAVE_VIEW.store(0, Ordering::SeqCst);
-            let new_path = to_wide_z(&fs_get(&FS_NEW_PATH));
+            let new_path = to_wide_z(&new_path_str);
             let idx_wide = to_wide_z(&idx);
             // SAFETY: kedua buffer hidup sampai panggilan selesai. Kegagalan dibiarkan seperti C++ (:517):
             // files.idx.new ditinggal.
@@ -936,8 +967,8 @@ unsafe extern "system" fn fs_search_thread(_param: *mut c_void) -> u32 {
             FS_HAVE_VIEW.store(i32::from(open), Ordering::SeqCst);
         }
         let (q, cap, gen) = {
-            let _cs = fs_cs();
-            (fs_get(&FS_Q), FS_QCAP.get(), FS_GEN.get())
+            let qs = fs_query_lock();
+            (qs.q.clone(), qs.cap, FS_GEN.get())
         };
         // C++ memeriksa qbuf[0] (:527): kueri kosong atau berawal NUL tidak dicari.
         if open && !q.is_empty() && !q.starts_with('\0') {
@@ -961,7 +992,7 @@ pub unsafe fn fs_accept_hits(gen: i32, res: *mut FsResult) -> bool {
         return false;
     }
     let fresh = if FS_RUNNING.get() {
-        let _cs = fs_cs();
+        let _cs = fs_query_lock();
         FS_GEN.get() == gen
     } else {
         false
