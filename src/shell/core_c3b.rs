@@ -1189,6 +1189,9 @@ pub fn update_foreground(force: bool) {
     // SAFETY: GetForegroundWindow tanpa parameter.
     let fg = unsafe { GetForegroundWindow() };
     let ada_fg = !fg.0.is_null();
+    if ada_fg {
+        unsafe { center_stuck_system_dialog(fg) };
+    }
     if ada_fg && is_our_window(fg) {
         // flyout dok diatur POP_OPEN; popup sistem sudah tertutup
         if POP_OPEN.get() {

@@ -462,7 +462,8 @@ pub fn pills_hide_for() {
     quiet_start(2500);
 }
 
-static LAST_CENTERED_DLG: SyncCell<Cell<HWND>> = SyncCell::new(Cell::new(HWND(std::ptr::null_mut())));
+static LAST_CENTERED_DLG: SyncCell<Cell<(HWND, u32)>> =
+    SyncCell::new(Cell::new((HWND(std::ptr::null_mut()), 0)));
 
 /// Read lowercase executable basename for a top-level window (resolving UWP CoreWindow child if hosted).
 unsafe fn window_exe_basename(h: HWND) -> Option<String> {
@@ -499,12 +500,34 @@ unsafe fn window_exe_basename(h: HWND) -> Option<String> {
 }
 
 /// Center Windows system picker dialogs (e.g. OpenWith "Just once / Always / Set default")
-/// that fall back to the top-left corner (0, 0) when Explorer's taskbar is hidden or absent.
-unsafe fn center_stuck_system_dialog(h: HWND) {
-    if h.0.is_null() || h == LAST_CENTERED_DLG.get() || is_our_window(h) {
+/// that fall back to the top-left corner when Explorer's taskbar is hidden or absent.
+pub(crate) unsafe fn center_stuck_system_dialog(h: HWND) {
+    if h.0.is_null() {
+        return;
+    }
+    let root = GetAncestor(h, GA_ROOT);
+    let h = if !root.0.is_null() { root } else { h };
+    if is_our_window(h) {
+        return;
+    }
+    let now = GetTickCount();
+    let (last_h, first_tick) = LAST_CENTERED_DLG.get();
+    // Allow recentering during the first 1.5s in case XAML layout resets position after show/uncloak,
+    // then leave the window alone so manual dragging always works.
+    if h == last_h && now.wrapping_sub(first_tick) >= 1500 {
         return;
     }
     if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() || IsZoomed(h).as_bool() {
+        return;
+    }
+    let mut cloaked: u32 = 0;
+    let _ = DwmGetWindowAttribute(
+        h,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut u32 as *mut std::ffi::c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
+    if cloaked != 0 {
         return;
     }
     let mut rc = RECT::default();
@@ -513,7 +536,7 @@ unsafe fn center_stuck_system_dialog(h: HWND) {
     }
     let w = rc.right - rc.left;
     let ht = rc.bottom - rc.top;
-    if w < 200 || ht < 150 {
+    if w < 180 || ht < 120 {
         return;
     }
     let mon = MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY);
@@ -531,7 +554,7 @@ unsafe fn center_stuck_system_dialog(h: HWND) {
     if w >= ww - 40 || ht >= wh - 40 {
         return;
     }
-    if rc.left < work.left - 16 || rc.left > work.left + 24 || rc.top < work.top - 16 || rc.top > work.top + 24 {
+    if rc.left < work.left - 24 || rc.left > work.left + 80 || rc.top < work.top - 24 || rc.top > work.top + 80 {
         return;
     }
     let Some(exe) = window_exe_basename(h) else {
@@ -551,7 +574,10 @@ unsafe fn center_stuck_system_dialog(h: HWND) {
         0,
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
     );
-    LAST_CENTERED_DLG.set(h);
+    if h != last_h {
+        LAST_CENTERED_DLG.set((h, now));
+        crate::log::log(&format!("recenter: {exe} ({},{} {}x{}) -> ({nx},{ny})", rc.left, rc.top, w, ht));
+    }
 }
 
 /// `WinEventProc` (C++ 4200): hook WinEvent untuk jendela app, taskbar bawaan, dan foreground.
@@ -596,8 +622,8 @@ pub unsafe extern "system" fn win_event_proc(
         return;
     }
     if ev == EVENT_OBJECT_DESTROY {
-        if has_h && is_win && h == LAST_CENTERED_DLG.get() {
-            LAST_CENTERED_DLG.set(HWND(std::ptr::null_mut()));
+        if has_h && is_win && h == LAST_CENTERED_DLG.get().0 {
+            LAST_CENTERED_DLG.set((HWND(std::ptr::null_mut()), 0));
         }
         // Jendela app ditutup: fokus sementara ke desktop tidak menampilkan pil atas.
         if has_h && is_win && is_self && is_known_app_window(h) {
@@ -635,6 +661,7 @@ pub unsafe extern "system" fn win_event_proc(
         return;
     }
     if ev == EV_OBJECT_UNCLOAKED {
+        center_stuck_system_dialog(h);
         // Uncloaked: hanya jendela taskbar.
         if is_task_window(h) {
             schedule_refresh();
